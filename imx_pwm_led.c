@@ -229,20 +229,22 @@ static u32 sample_rate      = 100; /* Fade sample rate in Hz */
 static u32 pwm_period       = 24000; /* 24 MHz IPG clk / 24000 = 1 kHz */
 static u32 pwm_prescaler    = 0; /* N-1 value, allowed range: 0 to 4095 */
 static u32 pwm_invert       = 0; /* 0=non-inverted, 1=inverted */
+static u32 pwm_phase_offset = 0; /* PWM channel phase offset in microseconds */
 static u32 max_fades        = 16;
 static u32 max_cues         = 16;
 static u32 max_leds         = 8; /* imx6ul has 8 PWMs */
 static u32 max_fade_size    = 4096; /* DMA memory block size is 4KB */
 static u32 sdma_priority    = 5; /* Allowed range: 1 to 6 */
-module_param(sample_rate,   uint, 0);
-module_param(pwm_period,    uint, 0);
-module_param(pwm_prescaler, uint, 0);
-module_param(pwm_invert,    uint, 0);
-module_param(max_fades,     uint, 0);
-module_param(max_cues,      uint, 0);
-module_param(max_leds,      uint, 0);
-module_param(max_fade_size, uint, 0);
-module_param(sdma_priority, uint, 0);
+module_param(sample_rate,      uint, 0);
+module_param(pwm_period,       uint, 0);
+module_param(pwm_prescaler,    uint, 0);
+module_param(pwm_invert,       uint, 0);
+module_param(pwm_phase_offset, uint, 0);
+module_param(max_fades,        uint, 0);
+module_param(max_cues,         uint, 0);
+module_param(max_leds,         uint, 0);
+module_param(max_fade_size,    uint, 0);
+module_param(sdma_priority,    uint, 0);
 /* clang-format on */
 
 /** Device global data, shared between all devices */
@@ -494,7 +496,7 @@ static int start_cue(struct imx_pwm_led *self, uint led_mask)
 	/* Enable the sdma channels: */
 	old_sdma_mask = sdma_event_enable_by_channel_mask(
 		self->sdma, sdma_mask, epit_sdma_event(self->epit));
-	// FIXME: It would be better to already have the priority enabled, but this doens't work as the SDMA already starts running
+	// FIXME: It would be better to already have the priority enabled, but this doesn't work as the SDMA already starts running
 	//        This must mean the EP[i] flag is already set before the EPIT event is even enabled. Is there a way to clear the
 	//        EP[i] flags? The set pending sets the flags - is it one of the registers?
 	for (i = 0; i < led_data.num_leds; i++) {
@@ -810,7 +812,7 @@ static void imx_pwm_led_sdma_callback(void *param)
  * PWM FUNCTIONS
  ******************************************************************************/
 
-static int enable_pwm(struct imx_pwm_led *self, u32 period, u32 prescaler,
+static int config_pwm(struct imx_pwm_led *self, u32 period, u32 prescaler,
 		      u32 invert)
 {
 	u32 cr;
@@ -829,7 +831,7 @@ static int enable_pwm(struct imx_pwm_led *self, u32 period, u32 prescaler,
 	}
 
 	cr = PWMCR_REPEAT_1 | PWMCR_DOZEEN | PWMCR_WAITEN | PWMCR_DBGEN |
-	     PWMCR_CLKSRC_IPG_HIGH | PWMCR_EN | PWMCR_PRESCALER(prescaler) |
+	     PWMCR_CLKSRC_IPG_HIGH | PWMCR_PRESCALER(prescaler) |
 	     PWMCR_POUTC(invert);
 
 	/* Software reset */
@@ -844,15 +846,22 @@ static int enable_pwm(struct imx_pwm_led *self, u32 period, u32 prescaler,
 
 	clk = clk_get_rate(self->clk_ipg);
 	clk /= prescaler + 1;
-	dev_dbg(self->dev, "%s: setting PWMPR: %08x (%u.%03u Hz)", __func__,
+	dev_dbg(self->dev, "%s: setting PWMPR: 0x%08x (%u.%03u Hz)", __func__,
 		period - 2, clk / period,
 		(((clk % period) * 1000) + (period / 2)) / period);
 	__raw_writel(period - 2, self->mmio_base + PWMPR);
 
-	/* Configure and enable */
-	dev_dbg(self->dev, "%s: setting PWMCR: %08x", __func__, cr);
+	/* Configure */
+	dev_dbg(self->dev, "%s: setting PWMCR: 0x%08x", __func__, cr);
 	__raw_writel(cr, self->mmio_base + PWMCR);
 	return 0;
+}
+
+static void enable_pwm(struct imx_pwm_led *self)
+{
+	u32 cr = __raw_readl(self->mmio_base + PWMCR);
+	cr |= PWMCR_EN;
+	__raw_writel(cr, self->mmio_base + PWMCR);
 }
 
 static void disable_pwm(struct imx_pwm_led *self)
@@ -1117,9 +1126,10 @@ static long ioctl_configure(struct imx_pwm_led *self, unsigned long arg)
 		return ret;
 	}
 	disable_pwm(self);
-	if ((ret = enable_pwm(self, period, prescaler, invert))) {
+	if ((ret = config_pwm(self, period, prescaler, invert))) {
 		return ret;
 	}
+	enable_pwm(self);
 	// FIXME: Use adaptive flag
 	return 0;
 }
@@ -1521,7 +1531,8 @@ static int imx_pwm_led_probe(struct platform_device *pdev)
 		goto probe_failed_dev_register;
 	}
 
-	if ((ret = enable_pwm(self, pwm_period, pwm_prescaler, pwm_invert))) {
+	/* Configure but don't yet enable the PWM channel: */
+	if ((ret = config_pwm(self, pwm_period, pwm_prescaler, pwm_invert))) {
 		goto probe_failed_pwm_enable;
 	}
 	led_data.num_leds++;
@@ -1625,6 +1636,7 @@ static struct platform_driver imx_pwm_led_driver = {
 static int __init imx_pwm_led_init(void)
 {
 	int ret;
+	uint i;
 
 	pr_info("%s: pwm_period=%u, sample_rate=%u Hz\n", THIS_MODULE->name,
 		pwm_period, sample_rate);
@@ -1681,6 +1693,17 @@ static int __init imx_pwm_led_init(void)
 		       THIS_MODULE->name);
 		return ret;
 	}
+
+	/* Enable all PWM channels at the same time, inserting the phase offset
+	 * delay when configured: */
+	local_irq_disable();
+	for (i = 0; i < led_data.num_leds; i++) {
+		if (i > 0) {
+			udelay(pwm_phase_offset);
+		}
+		enable_pwm(led_data.leds[i]);
+	}
+	local_irq_enable();
 
 	return 0;
 }
