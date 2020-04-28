@@ -118,12 +118,20 @@
  * TYPES
  ******************************************************************************/
 
-/** Open object enum */
 /* clang-format off */
+/** Open object enum */
 enum open_object_type {
 	OPEN_OBJECT_TYPE_NONE,
 	OPEN_OBJECT_TYPE_FADE,
 	OPEN_OBJECT_TYPE_CUE
+};
+
+/** Fade direction enum */
+enum fade_dir {
+	FADE_DIR_UNKNOWN,
+	FADE_DIR_INCREASING,
+	FADE_DIR_DECREASING,
+	FADE_DIR_NON_MONOTONIC
 };
 /* clang-format on */
 
@@ -165,6 +173,8 @@ struct imx_pwm_led {
 	uint open_object_idx;
 	/** True if writing is ongoing */
 	int writing;
+	/** True if adaptive mode is enabled */
+	int adaptive;
 };
 
 /** Fade struct */
@@ -179,6 +189,8 @@ struct led_fade {
 	struct mutex lock;
 	/** PID of owner */
 	pid_t owner_pid;
+	/** Direction */
+	enum fade_dir dir;
 };
 
 /** Cue item struct */
@@ -223,8 +235,8 @@ struct led_data {
  * VARIABLES & CONSTANTS
  ******************************************************************************/
 
-/** Module Parameters */
 /* clang-format off */
+/** Module Parameters */
 static u32 sample_rate      = 100; /* Fade sample rate in Hz */
 static u32 pwm_period       = 24000; /* 24 MHz IPG clk / 24000 = 1 kHz */
 static u32 pwm_prescaler    = 0; /* N-1 value, allowed range: 0 to 4095 */
@@ -315,6 +327,83 @@ static u32 convert_mask_sdma_to_led(uint sdma_mask)
 		}
 	}
 	return led_mask;
+}
+
+/*******************************************************************************
+ * PWM FUNCTIONS
+ ******************************************************************************/
+
+static int config_pwm(struct imx_pwm_led *self, u32 period, u32 prescaler,
+		      u32 invert)
+{
+	u32 cr;
+	uint clk;
+
+	/* Enable clocks */
+	int ret = 0;
+
+	if ((ret = clk_prepare_enable(self->clk_per))) {
+		dev_err(self->dev, "%s: failed to enable PER clock", __func__);
+		return ret;
+	}
+	if ((ret = clk_prepare_enable(self->clk_ipg))) {
+		dev_err(self->dev, "%s: failed to enable IPG clock", __func__);
+		return ret;
+	}
+
+	cr = PWMCR_REPEAT_1 | PWMCR_DOZEEN | PWMCR_WAITEN | PWMCR_DBGEN |
+	     PWMCR_CLKSRC_IPG_HIGH | PWMCR_PRESCALER(prescaler) |
+	     PWMCR_POUTC(invert);
+
+	/* Software reset */
+	__raw_writel(PWMCR_SWR, self->mmio_base + PWMCR);
+	udelay(10);
+	/* Activate & de-activate PWM (seems to be necessary after a reset) */
+	__raw_writel(PWMCR_EN, self->mmio_base + PWMCR);
+	__raw_writel(0, self->mmio_base + PWMCR);
+
+	/* Silence */
+	__raw_writel(0, self->mmio_base + PWMSAR);
+
+	clk = clk_get_rate(self->clk_ipg);
+	clk /= prescaler + 1;
+	dev_dbg(self->dev, "%s: setting PWMPR: 0x%08x (%u.%03u Hz)", __func__,
+		period - 2, clk / period,
+		(((clk % period) * 1000) + (period / 2)) / period);
+	__raw_writel(period - 2, self->mmio_base + PWMPR);
+
+	/* Configure */
+	dev_dbg(self->dev, "%s: setting PWMCR: 0x%08x", __func__, cr);
+	__raw_writel(cr, self->mmio_base + PWMCR);
+	return 0;
+}
+
+static void enable_pwm(struct imx_pwm_led *self)
+{
+	u32 cr = __raw_readl(self->mmio_base + PWMCR);
+	cr |= PWMCR_EN;
+	__raw_writel(cr, self->mmio_base + PWMCR);
+}
+
+static void disable_pwm(struct imx_pwm_led *self)
+{
+	u32 cr = 0;
+	dev_dbg(self->dev, "%s", __func__);
+	/* Disable PWM */
+	__raw_writel(cr, self->mmio_base + PWMCR);
+	/* Release clocks */
+	clk_disable_unprepare(self->clk_per);
+	clk_disable_unprepare(self->clk_ipg);
+}
+
+static inline void set_pwm_duty(struct imx_pwm_led *self, uint duty)
+{
+	__raw_writel(duty, self->mmio_base + PWMSAR);
+}
+
+static inline uint get_pwm_duty(struct imx_pwm_led *self)
+{
+	return __raw_readl(self->mmio_base + PWMSAR);
 }
 
 /*******************************************************************************
@@ -566,6 +655,100 @@ static int stop_cue(struct imx_pwm_led *self, uint led_mask)
 	return 0;
 }
 
+static void find_fade_dir(struct imx_pwm_led *self, struct led_fade *fade,
+			  uint size)
+{
+	const u16 *itr, *end;
+	if (fade->dir == FADE_DIR_NON_MONOTONIC) {
+		return;
+	}
+	itr = &((const u16 *)fade->buf)[fade->len / sizeof(u16)];
+	end = &((const u16 *)fade->buf)[(fade->len + size) / sizeof(u16)];
+	if ((fade->len / sizeof(u16)) == 0) {
+		itr++;
+	}
+	while (itr < end) {
+		uint val = *itr;
+		uint last_val = *(itr - 1);
+		if (val > last_val) {
+			if (fade->dir == FADE_DIR_UNKNOWN) {
+				dev_dbg(self->dev, "%s: increasing", __func__);
+				fade->dir = FADE_DIR_INCREASING;
+			} else if (fade->dir != FADE_DIR_INCREASING) {
+				dev_dbg(self->dev,
+					"%s: non-monotonic at sample %u",
+					__func__, itr - (const u16 *)fade->buf);
+				fade->dir = FADE_DIR_NON_MONOTONIC;
+				break;
+			} else {
+				/* Still increasing */
+			}
+		} else if (val < last_val) {
+			if (fade->dir == FADE_DIR_UNKNOWN) {
+				dev_dbg(self->dev, "%s: decreasing", __func__);
+				fade->dir = FADE_DIR_DECREASING;
+			} else if (fade->dir != FADE_DIR_DECREASING) {
+				dev_dbg(self->dev,
+					"%s: non-monotonic at sample %u",
+					__func__, itr - (const u16 *)fade->buf);
+				fade->dir = FADE_DIR_NON_MONOTONIC;
+				break;
+			} else {
+				/* Still decreasing */
+			}
+		} else {
+			/* Same */
+		}
+		itr++;
+	}
+}
+
+static uint adapt_fade(struct imx_pwm_led *self, const struct led_fade *fade,
+		       uint current_duty)
+{
+	int l = 0;
+	int r = (fade->len / sizeof(u16)) - 1;
+	int m = 0;
+	uint val;
+	if (r < 0) {
+		dev_warn(self->dev, "%s: no data", __func__);
+		return 0;
+	}
+	/* If the direction is unknown or non-monotonic: */
+	if ((fade->dir != FADE_DIR_INCREASING) &&
+	    (fade->dir != FADE_DIR_DECREASING)) {
+		dev_warn(self->dev, "%s: non-monotonic fade", __func__);
+		return 0;
+	}
+	/* Binary search: */
+	while (l <= r) {
+		m = (l + r) / 2;
+		val = ((const u16 *)fade->buf)[m];
+		if ((fade->dir == FADE_DIR_INCREASING) ? (val < current_duty) :
+							 (val > current_duty)) {
+			l = m + 1;
+		} else if ((fade->dir == FADE_DIR_INCREASING) ?
+				   (val > current_duty) :
+				   (val < current_duty)) {
+			r = m - 1;
+		} else {
+			break;
+		}
+	}
+	/* If an adaptation is being made: */
+	if (m != 0) {
+		dev_dbg(self->dev,
+			"%s: dir: %s, current_duty: %u, nearest_idx: %u, "
+			"nearest_duty: %u",
+			__func__,
+			(fade->dir == FADE_DIR_INCREASING) ? "increasing" :
+							     "decreasing",
+			current_duty, (uint)m, val);
+	}
+	/* Return byte offset: */
+	return (uint)m * sizeof(u16);
+}
+
 /*******************************************************************************
  * SDMA FUNCTIONS
  ******************************************************************************/
@@ -637,7 +820,8 @@ static int load_sdma_fade(struct imx_pwm_led *self, uint fade_idx)
 	int ret;
 	const struct led_fade *fade;
 	struct sdma_context_data context = { { 0 } };
-	dev_dbg(self->dev, "%s: led=%u, fade=%u", __func__, self->led_idx,
+	u32 offset = 0;
+	dev_dbg(self->dev, "%s: led: %u, fade: %u", __func__, self->led_idx,
 		fade_idx);
 
 	if ((ret = open_fade(self, fade_idx))) {
@@ -657,11 +841,15 @@ static int load_sdma_fade(struct imx_pwm_led *self, uint fade_idx)
 		return -EFAULT;
 	}
 
+	if (self->adaptive) {
+		offset = adapt_fade(self, fade, get_pwm_duty(self));
+	}
+
 	/* Write the ARG_END and MSA; as well as the MDA,
 	 * since it's in the middle */
 	context.gReg[ARG_END] = fade->buf_phys + fade->len;
 	context.mda = self->mmio_base_phys + PWMSAR;
-	context.msa = fade->buf_phys;
+	context.msa = fade->buf_phys + offset;
 
 	/* This operation is run by channel 0, which is mutually exclusive with
 	 * our scripts's channel. Since only one channel is running at a time,
@@ -687,7 +875,7 @@ static int load_sdma_duty(struct imx_pwm_led *self, uint cue_idx, uint led_idx,
 	uint duty_offset = (cue_idx * max_leds) + led_idx;
 	dma_addr_t duty_phys =
 		led_data.duty_buf_phys + (duty_offset * sizeof(u16));
-	dev_dbg(self->dev, "%s: cue=%u, led=%u, duty=%u", __func__, cue_idx,
+	dev_dbg(self->dev, "%s: cue: %u, led: %u, duty: %u", __func__, cue_idx,
 		led_idx, duty);
 	led_data.duty_buf[duty_offset] = duty;
 
@@ -809,83 +997,6 @@ static void imx_pwm_led_sdma_callback(void *param)
 }
 
 /*******************************************************************************
- * PWM FUNCTIONS
- ******************************************************************************/
-
-static int config_pwm(struct imx_pwm_led *self, u32 period, u32 prescaler,
-		      u32 invert)
-{
-	u32 cr;
-	uint clk;
-
-	/* Enable clocks */
-	int ret = 0;
-
-	if ((ret = clk_prepare_enable(self->clk_per))) {
-		dev_err(self->dev, "%s: failed to enable PER clock", __func__);
-		return ret;
-	}
-	if ((ret = clk_prepare_enable(self->clk_ipg))) {
-		dev_err(self->dev, "%s: failed to enable IPG clock", __func__);
-		return ret;
-	}
-
-	cr = PWMCR_REPEAT_1 | PWMCR_DOZEEN | PWMCR_WAITEN | PWMCR_DBGEN |
-	     PWMCR_CLKSRC_IPG_HIGH | PWMCR_PRESCALER(prescaler) |
-	     PWMCR_POUTC(invert);
-
-	/* Software reset */
-	__raw_writel(PWMCR_SWR, self->mmio_base + PWMCR);
-	udelay(10);
-	/* Activate & de-activate PWM (seems to be necessary after a reset) */
-	__raw_writel(PWMCR_EN, self->mmio_base + PWMCR);
-	__raw_writel(0, self->mmio_base + PWMCR);
-
-	/* Silence */
-	__raw_writel(0, self->mmio_base + PWMSAR);
-
-	clk = clk_get_rate(self->clk_ipg);
-	clk /= prescaler + 1;
-	dev_dbg(self->dev, "%s: setting PWMPR: 0x%08x (%u.%03u Hz)", __func__,
-		period - 2, clk / period,
-		(((clk % period) * 1000) + (period / 2)) / period);
-	__raw_writel(period - 2, self->mmio_base + PWMPR);
-
-	/* Configure */
-	dev_dbg(self->dev, "%s: setting PWMCR: 0x%08x", __func__, cr);
-	__raw_writel(cr, self->mmio_base + PWMCR);
-	return 0;
-}
-
-static void enable_pwm(struct imx_pwm_led *self)
-{
-	u32 cr = __raw_readl(self->mmio_base + PWMCR);
-	cr |= PWMCR_EN;
-	__raw_writel(cr, self->mmio_base + PWMCR);
-}
-
-static void disable_pwm(struct imx_pwm_led *self)
-{
-	u32 cr = 0;
-	dev_dbg(self->dev, "%s", __func__);
-	/* Disable PWM */
-	__raw_writel(cr, self->mmio_base + PWMCR);
-	/* Release clocks */
-	clk_disable_unprepare(self->clk_per);
-	clk_disable_unprepare(self->clk_ipg);
-}
-
-static inline void set_pwm_duty(struct imx_pwm_led *self, uint duty)
-{
-	__raw_writel(duty, self->mmio_base + PWMSAR);
-}
-
-static inline uint get_pwm_duty(struct imx_pwm_led *self)
-{
-	return __raw_readl(self->mmio_base + PWMSAR);
-}
-
-/*******************************************************************************
  * USERSPACE API
  ******************************************************************************/
 
@@ -984,6 +1095,7 @@ static ssize_t imx_pwm_led_dev_write(struct file *filp, const char __user *data,
 		if (!self->writing) {
 			self->writing = 1;
 			fade->len = 0;
+			fade->dir = FADE_DIR_UNKNOWN;
 		}
 		if (fade->len >= max_fade_size) {
 			dev_warn(dev, "write: fade %u: buffer full",
@@ -997,6 +1109,7 @@ static ssize_t imx_pwm_led_dev_write(struct file *filp, const char __user *data,
 			dev_err(dev, "write: failed userspace copy");
 			return -EFAULT;
 		}
+		find_fade_dir(self, fade, nbytes);
 		fade->len += nbytes;
 		dev_dbg(dev, "write: fade %u: %u bytes, total len %u bytes",
 			self->open_object_idx, nbytes, fade->len);
@@ -1105,12 +1218,9 @@ static long ioctl_configure(struct imx_pwm_led *self, unsigned long arg)
 	uint prescaler = (arg & PWM_LED_CFG_MASK_PRESCALER) >>
 			 PWM_LED_CFG_BIT_PRESCALER;
 	uint invert = (arg & PWM_LED_CFG_MASK_INVERT) >> PWM_LED_CFG_BIT_INVERT;
-	uint adaptive = (arg & PWM_LED_CFG_MASK_ADAPTIVE) >>
-			PWM_LED_CFG_BIT_ADAPTIVE;
 	dev_dbg(self->dev,
-		"ioctl: CONFIGURE: period=%u, prescaler=%u, invert=%u, "
-		"adaptive=%u",
-		period, prescaler, invert, adaptive);
+		"ioctl: CONFIGURE: period: %u, prescaler: %u, invert: %u",
+		period, prescaler, invert);
 	if ((period < 2) || (period > __UINT16_MAX__)) {
 		dev_warn(self->dev, "ioctl: CONFIGURE: invalid period %u",
 			 period);
@@ -1130,7 +1240,6 @@ static long ioctl_configure(struct imx_pwm_led *self, unsigned long arg)
 		return ret;
 	}
 	enable_pwm(self);
-	// FIXME: Use adaptive flag
 	return 0;
 }
 
@@ -1166,9 +1275,16 @@ static long ioctl_set_active(struct imx_pwm_led *self, unsigned long arg)
 {
 	int ret;
 	dev_dbg(self->dev, "ioctl: SET_ACTIVE: %lu", arg);
-	if ((ret = set_sdma_active(self, arg))) {
+	if ((ret = set_sdma_active(self, arg != 0))) {
 		return ret;
 	}
+	return 0;
+}
+
+static long ioctl_set_adapt(struct imx_pwm_led *self, unsigned long arg)
+{
+	dev_dbg(self->dev, "ioctl: SET_ADAPT: %lu", arg);
+	self->adaptive = arg != 0;
 	return 0;
 }
 
@@ -1234,7 +1350,7 @@ static long ioctl_stop_cue(struct imx_pwm_led *self, unsigned long arg)
 {
 	int ret;
 	uint led_mask;
-	dev_dbg(self->dev, "ioctl: STOP_CUE=%lu", arg);
+	dev_dbg(self->dev, "ioctl: STOP_CUE: %lu", arg);
 	/* 1. Get the leds in the cue */
 	if ((ret = get_cue_led_mask(self, arg, &led_mask))) {
 		return ret;
@@ -1275,6 +1391,7 @@ static long imx_pwm_led_dev_ioctl(struct file *filp, unsigned int cmd,
 	case PWM_LED_SET_ACTIVE: ret = ioctl_set_active(self, arg); break;
 	case PWM_LED_SET_DUTY:   ret = ioctl_set_duty  (self, arg); break;
 	case PWM_LED_GET_DUTY:   ret = ioctl_get_duty  (self, arg); break;
+	case PWM_LED_SET_ADAPT:  ret = ioctl_set_adapt (self, arg); break;
 	/* clang-format on */
 	default:
 		dev_warn(dev, "ioctl: invalid cmd 0x%02X, dir %u, size %u",
@@ -1638,7 +1755,7 @@ static int __init imx_pwm_led_init(void)
 	int ret;
 	uint i;
 
-	pr_info("%s: pwm_period=%u, sample_rate=%u Hz\n", THIS_MODULE->name,
+	pr_info("%s: pwm_period: %u, sample_rate: %u Hz\n", THIS_MODULE->name,
 		pwm_period, sample_rate);
 
 	/* Reject nonsense parameters */
@@ -1660,6 +1777,11 @@ static int __init imx_pwm_led_init(void)
 	if (pwm_invert > 1) {
 		pr_err("%s: value %u is invalid for pwm_invert param\n",
 		       THIS_MODULE->name, pwm_invert);
+		return -EINVAL;
+	}
+	if (pwm_phase_offset > (MAX_UDELAY_MS * 1000)) {
+		pr_err("%s: value %u is invalid for pwm_phase_offset param\n",
+		       THIS_MODULE->name, pwm_phase_offset);
 		return -EINVAL;
 	}
 	if ((max_leds == 0) || (max_leds > 32)) {

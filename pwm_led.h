@@ -40,16 +40,15 @@
 #define PWM_LED_SET_ACTIVE _IO( PWM_LED_IOC_TYPE, 0x49        ) /* 0x00007549 */
 #define PWM_LED_SET_DUTY   _IO( PWM_LED_IOC_TYPE, 0x4A        ) /* 0x0000754A */
 #define PWM_LED_GET_DUTY   _IOR(PWM_LED_IOC_TYPE, 0x4B, ushort) /* 0x8002754B */
+#define PWM_LED_SET_ADAPT  _IO( PWM_LED_IOC_TYPE, 0x4C        ) /* 0x0000754C */
 
 /** PWM_LED_CONFIGURE defines */
 #define PWM_LED_CFG_BIT_PERIOD     0
 #define PWM_LED_CFG_BIT_PRESCALER  16
 #define PWM_LED_CFG_BIT_INVERT     28
-#define PWM_LED_CFG_BIT_ADAPTIVE   29
 #define PWM_LED_CFG_MASK_PERIOD    0x0000FFFF /* Range 2 to 65535 */
 #define PWM_LED_CFG_MASK_PRESCALER 0x0FFF0000 /* N-1 value, range 0 to 4095 */
 #define PWM_LED_CFG_MASK_INVERT    0x10000000
-#define PWM_LED_CFG_MASK_ADAPTIVE  0x20000000
 
 /** After a cue is opened using PWM_LED_OPEN_CUE, u32 'cue items' shall be
  *  written to the device in the following format. */
