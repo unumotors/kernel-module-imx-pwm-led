@@ -46,7 +46,6 @@
 #include <linux/slab.h>
 #include <linux/types.h>
 
-// FIXME: Implement the active functionality
 // FIXME: There's no need to load 8 copies of the script, it can just be loaded once by the first channel.
 //        So it would be worth having different DT properties for channel and script address - latter only needed for channel 0.
 //        Also remember to prefix the custom DT properties with 'unu,'
@@ -261,8 +260,9 @@ module_param(sdma_priority,    uint, 0);
 static struct led_data led_data;
 
 static const u32 sdma_script[] = { 0x0a000901, 0x69c80400, 0x69c86300,
-				   0x03df7d04, 0x620a6a2b, 0x01607df7,
-				   0x03000160, 0x7df40000 };
+				   0x03df7d09, 0x620a4e00, 0x7c036a2b,
+				   0x01607df5, 0x6e2b0160, 0x7df20300,
+				   0x01607def };
 
 /*******************************************************************************
  * UTILITY FUNCTIONS
@@ -397,6 +397,11 @@ static void disable_pwm(struct imx_pwm_led *self)
 	/* Release clocks */
 	clk_disable_unprepare(self->clk_per);
 	clk_disable_unprepare(self->clk_ipg);
+}
+
+static inline void set_pwm_duty(struct imx_pwm_led *self, uint duty)
+{
+	__raw_writel(duty, self->mmio_base + PWMSAR);
 }
 
 /*******************************************************************************
@@ -730,9 +735,7 @@ static uint adapt_fade(struct imx_pwm_led *self, const struct led_fade *fade,
 	}
 	/* If an adaptation is being made: */
 	if (l != 0) {
-		dev_dbg(self->dev,
-			"%s: dir: %s, idx: %u, duty: %u",
-			__func__,
+		dev_dbg(self->dev, "%s: dir: %s, idx: %u, duty: %u", __func__,
 			(fade->dir == FADE_DIR_INCREASING) ? "inc" : "dec",
 			current_duty, l, ((const u16 *)fade->buf)[l]);
 	}
@@ -999,6 +1002,22 @@ static int set_sdma_active(struct imx_pwm_led *self, int active)
 		dev_err(self->dev, "%s: failed to load context", __func__);
 	}
 	return 0;
+}
+
+static int is_sdma_playing(struct imx_pwm_led *self)
+{
+	struct sdma_context_data context = { { 0 } };
+	/* Fetch the current MSA and end addresses: */
+	int ret = sdma_fetch_partial_context(
+		self->sdmac, &context.gReg[ARG_END],
+		offsetof(struct sdma_context_data, gReg[ARG_END]),
+		12); /* 3 * sizeof(u32) = 12 bytes */
+	if (ret) {
+		dev_err(self->dev, "%s: failed to fetch context", __func__);
+	}
+	ret = context.msa < context.gReg[ARG_END];
+	dev_dbg(self->dev, "%s: %d", __func__, ret);
+	return ret;
 }
 
 /**
@@ -1299,11 +1318,30 @@ static long ioctl_get_duty(struct imx_pwm_led *self, unsigned long arg)
 
 static long ioctl_set_active(struct imx_pwm_led *self, unsigned long arg)
 {
+	uint duty;
 	int ret;
 	dev_dbg(self->dev, "ioctl: SET_ACTIVE: %lu", arg);
 	if ((ret = set_sdma_active(self, arg != 0))) {
 		return ret;
 	}
+	/* Fetch the playing status: */
+	ret = is_sdma_playing(self);
+	/* If there was an error getting the status: */
+	if (ret < 0) {
+		return ret;
+	}
+	/* If the LED is currently playing: */
+	if (ret) {
+		/* The SDMA will set the actual duty: */
+		return 0;
+	}
+
+	/* Fetch the current duty: */
+	if ((ret = fetch_sdma_duty(self, &duty))) {
+		return ret;
+	}
+	/* Set the PWM duty to the current duty if active, otherwise zero: */
+	set_pwm_duty(self, arg ? duty : 0);
 	return 0;
 }
 
