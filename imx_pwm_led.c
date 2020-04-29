@@ -46,10 +46,8 @@
 #include <linux/slab.h>
 #include <linux/types.h>
 
-// FIXME: There's no need to load 8 copies of the script, it can just be loaded once by the first channel.
-//        So it would be worth having different DT properties for channel and script address - latter only needed for channel 0.
-//        Also remember to prefix the custom DT properties with 'unu,'
 // FIXME: More things should only be done by channel 0: start/stop EPIT
+// FIXME: Locking of fade buffers when playing
 
 /*******************************************************************************
  * MACROS
@@ -150,8 +148,6 @@ struct imx_pwm_led {
 	struct miscdevice led_dev;
 	/** Pointer to the timer used to drive the DMA engine */
 	struct epit *epit;
-	/** SDMA script load address (offset in bytes) */
-	u32 sdma_script_origin;
 	/** SDMA channel number */
 	u32 sdma_ch_num;
 	/** Pointer to the SDMA engine */
@@ -212,8 +208,8 @@ struct led_cue {
 	pid_t owner_pid;
 };
 
-/** Device global data struct */
-struct led_data {
+/** Module global data struct */
+struct glb_data {
 	/** Array of leds */
 	struct imx_pwm_led **leds;
 	/** Array of fades */
@@ -226,6 +222,8 @@ struct led_data {
 	dma_addr_t duty_buf_phys;
 	/** Number of configured leds */
 	uint num_leds;
+	/** SDMA script load address (SDMA address in words) */
+	u32 sdma_script_origin;
 };
 
 /*******************************************************************************
@@ -257,12 +255,14 @@ module_param(sdma_priority,    uint, 0);
 /* clang-format on */
 
 /** Device global data, shared between all devices */
-static struct led_data led_data;
+static struct glb_data glb_data;
 
-static const u32 sdma_script[] = { 0x0a000901, 0x69c80400, 0x69c86300,
-				   0x03df7d09, 0x620a4e00, 0x7c036a2b,
-				   0x01607df5, 0x6e2b0160, 0x7df20300,
-				   0x01607def };
+/** SDMA script compiled from imx_pwm_led_sdma.asm using sdma_asm.pl from
+ *  http://billauer.co.il/blog/2011/10/imx-sdma-howto-assembler-linux/ */
+static const u32 sdma_script[] = {
+	0x0a000901, 0x69c80400, 0x69c86300, 0x03df7d09, 0x620a4e00,
+	0x7c036a2b, 0x01607df5, 0x6e2b0160, 0x7df20300, 0x01607def,
+};
 
 /*******************************************************************************
  * UTILITY FUNCTIONS
@@ -291,9 +291,9 @@ static uint get_duty_buf_size(void)
 static void lock_leds(uint led_mask)
 {
 	uint i;
-	for (i = 0; i < led_data.num_leds; i++) {
+	for (i = 0; i < glb_data.num_leds; i++) {
 		if (led_mask & (1 << i)) {
-			mutex_lock(&led_data.leds[i]->lock);
+			mutex_lock(&glb_data.leds[i]->lock);
 		}
 	}
 }
@@ -301,9 +301,9 @@ static void lock_leds(uint led_mask)
 static void unlock_leds(uint led_mask)
 {
 	uint i;
-	for (i = 0; i < led_data.num_leds; i++) {
+	for (i = 0; i < glb_data.num_leds; i++) {
 		if (led_mask & (1 << i)) {
-			mutex_unlock(&led_data.leds[i]->lock);
+			mutex_unlock(&glb_data.leds[i]->lock);
 		}
 	}
 }
@@ -312,9 +312,9 @@ static u32 convert_mask_led_to_sdma(uint led_mask)
 {
 	uint i;
 	u32 sdma_mask = 0;
-	for (i = 0; i < led_data.num_leds; i++) {
+	for (i = 0; i < glb_data.num_leds; i++) {
 		if (led_mask & (1 << i)) {
-			sdma_mask |= 1 << led_data.leds[i]->sdma_ch_num;
+			sdma_mask |= 1 << glb_data.leds[i]->sdma_ch_num;
 		}
 	}
 	return sdma_mask;
@@ -324,8 +324,8 @@ static u32 convert_mask_sdma_to_led(uint sdma_mask)
 {
 	uint i;
 	u32 led_mask = 0;
-	for (i = 0; i < led_data.num_leds; i++) {
-		if (sdma_mask & (1 << led_data.leds[i]->sdma_ch_num)) {
+	for (i = 0; i < glb_data.num_leds; i++) {
+		if (sdma_mask & (1 << glb_data.leds[i]->sdma_ch_num)) {
 			led_mask |= 1 << i;
 		}
 	}
@@ -417,7 +417,7 @@ static int open_fade(struct imx_pwm_led *self, uint fade_idx)
 			 fade_idx, max_fades);
 		return -EINVAL;
 	}
-	fade = &led_data.fades[fade_idx];
+	fade = &glb_data.fades[fade_idx];
 	mutex_lock(&fade->lock);
 	if (am_not_owner(fade->owner_pid)) {
 		dev_warn(self->dev, "%s: fade %u is owned by pid %d", __func__,
@@ -440,7 +440,7 @@ static int open_cue(struct imx_pwm_led *self, uint cue_idx)
 			 max_cues);
 		return -EINVAL;
 	}
-	cue = &led_data.cues[cue_idx];
+	cue = &glb_data.cues[cue_idx];
 	mutex_lock(&cue->lock);
 	if (am_not_owner(cue->owner_pid)) {
 		dev_warn(self->dev, "%s: cue %u is owned by pid %d", __func__,
@@ -463,7 +463,7 @@ static int close_fade(struct imx_pwm_led *self, uint fade_idx)
 			 fade_idx, max_fades);
 		return -EINVAL;
 	}
-	fade = &led_data.fades[fade_idx];
+	fade = &glb_data.fades[fade_idx];
 	mutex_lock(&fade->lock);
 	if (am_not_owner(fade->owner_pid)) {
 		dev_warn(self->dev, "%s: fade %u is owned by pid %d", __func__,
@@ -486,7 +486,7 @@ static int close_cue(struct imx_pwm_led *self, uint cue_idx)
 			 max_cues);
 		return -EINVAL;
 	}
-	cue = &led_data.cues[cue_idx];
+	cue = &glb_data.cues[cue_idx];
 	mutex_lock(&cue->lock);
 	if (am_not_owner(cue->owner_pid)) {
 		dev_warn(self->dev, "%s: cue %u is owned by pid %d", __func__,
@@ -511,7 +511,7 @@ static int get_cue_led_mask(struct imx_pwm_led *self, uint cue_idx,
 	if ((ret = open_cue(self, cue_idx))) {
 		return ret;
 	}
-	cue = &led_data.cues[cue_idx];
+	cue = &glb_data.cues[cue_idx];
 
 	if (cue->len == 0) {
 		dev_warn(self->dev, "%s: cue %u: len == 0", __func__, cue_idx);
@@ -528,12 +528,12 @@ static int get_cue_led_mask(struct imx_pwm_led *self, uint cue_idx,
 	num_items = cue->len / sizeof(struct led_cue_item);
 	for (i = 0; i < num_items; i++) {
 		const struct led_cue_item *item = &cue->items[i];
-		if (item->led_idx >= led_data.num_leds) {
+		if (item->led_idx >= glb_data.num_leds) {
 			dev_warn(self->dev,
 				 "%s: cue %u: item %u: "
 				 "led_idx %u >= num_leds %u",
 				 __func__, cue_idx, i, item->led_idx,
-				 led_data.num_leds);
+				 glb_data.num_leds);
 			return -EFAULT;
 		}
 		*led_mask |= 1 << item->led_idx;
@@ -569,11 +569,11 @@ static int start_cue(struct imx_pwm_led *self, uint led_mask)
 	uint i;
 	u32 old_sdma_mask, sdma_mask, old_led_mask, started_led_mask;
 
-	for (i = 0; i < led_data.num_leds; i++) {
+	for (i = 0; i < glb_data.num_leds; i++) {
 		if ((led_mask & (1 << i)) &&
-		    am_not_owner(led_data.leds[i]->owner_pid)) {
+		    am_not_owner(glb_data.leds[i]->owner_pid)) {
 			dev_warn(self->dev, "%s: led %u is owned by pid %d",
-				 __func__, i, led_data.leds[i]->owner_pid);
+				 __func__, i, glb_data.leds[i]->owner_pid);
 			return -EPERM;
 		}
 	}
@@ -586,10 +586,10 @@ static int start_cue(struct imx_pwm_led *self, uint led_mask)
 	// FIXME: It would be better to already have the priority enabled, but this doesn't work as the SDMA already starts running
 	//        This must mean the EP[i] flag is already set before the EPIT event is even enabled. Is there a way to clear the
 	//        EP[i] flags? The set pending sets the flags - is it one of the registers?
-	for (i = 0; i < led_data.num_leds; i++) {
+	for (i = 0; i < glb_data.num_leds; i++) {
 		if (led_mask & (1 << i)) {
 			/* Set a nonzero priority to start the script */
-			sdma_set_channel_priority(led_data.leds[i]->sdmac,
+			sdma_set_channel_priority(glb_data.leds[i]->sdmac,
 						  sdma_priority);
 		}
 	}
@@ -625,11 +625,11 @@ static int stop_cue(struct imx_pwm_led *self, uint led_mask)
 	uint i;
 	u32 old_sdma_mask, sdma_mask, old_led_mask, stopped_led_mask;
 
-	for (i = 0; i < led_data.num_leds; i++) {
+	for (i = 0; i < glb_data.num_leds; i++) {
 		if ((led_mask & (1 << i)) &&
-		    am_not_owner(led_data.leds[i]->owner_pid)) {
+		    am_not_owner(glb_data.leds[i]->owner_pid)) {
 			dev_warn(self->dev, "%s: led %u is owned by pid %d",
-				 __func__, i, led_data.leds[i]->owner_pid);
+				 __func__, i, glb_data.leds[i]->owner_pid);
 			return -EPERM;
 		}
 	}
@@ -728,9 +728,9 @@ static uint adapt_fade(struct imx_pwm_led *self, const struct led_fade *fade,
 			r = m;
 		}
 	}
-	/* If the current duty is larger than all of the values: */
+	/* If the current duty is >/< than all of the fade values: */
 	if (l >= len) {
-		/* Use the last value: */
+		/* Use the last fade value: */
 		l = len - 1;
 	}
 	/* If an adaptation is being made: */
@@ -757,25 +757,15 @@ static int load_sdma_script(struct imx_pwm_led *self)
 	/* write the script code to SDMA RAM */
 	dev_dbg(self->dev, "%s: %d bytes", __func__, script_len);
 	ret = sdma_write_datamem(self->sdma, (void *)script, script_len,
-				 self->sdma_script_origin);
+				 glb_data.sdma_script_origin);
 	if (ret) {
 		dev_err(self->dev, "%s: failed to write data", __func__);
-		return ret;
-	}
-
-	/* load the initial context */
-	ret = sdma_load_partial_context(self->sdmac, &initial_context, 0,
-					sizeof(initial_context));
-	if (ret) {
-		dev_err(self->dev, "%s: failed to load context", __func__);
 		return ret;
 	}
 	return 0;
 }
 
-/**
- * Sets script program counter and initial arguments
- */
+/** Sets script program counter and initial arguments */
 static int load_sdma_initial_context(struct imx_pwm_led *self)
 {
 	int ret;
@@ -783,8 +773,8 @@ static int load_sdma_initial_context(struct imx_pwm_led *self)
 
 	/* set the script arguments and initial PC;
 	 * see the specific asm file for argument requirements;
-	 * (in program space addressing) */
-	context.channel_state.pc = self->sdma_script_origin * 2;
+	 * (in program space addressing - halfwords) */
+	context.channel_state.pc = glb_data.sdma_script_origin * 2;
 	context.gReg[ARG_ACTIVE] = DEFAULT_ACTIVE;
 	context.mda = self->mmio_base_phys + PWMSAR;
 	/* destination address frozen;
@@ -816,10 +806,9 @@ static int load_sdma_duty(struct imx_pwm_led *self, uint cue_idx, uint led_idx,
 	struct sdma_context_data context = { { 0 } };
 	uint duty_offset = (cue_idx * max_leds) + led_idx;
 	dma_addr_t duty_phys =
-		led_data.duty_buf_phys + (duty_offset * sizeof(u16));
-	dev_dbg(self->dev, "%s: cue: %u, led: %u, duty: %u", __func__, cue_idx,
-		led_idx, duty);
-	led_data.duty_buf[duty_offset] = duty;
+		glb_data.duty_buf_phys + (duty_offset * sizeof(u16));
+	dev_dbg(self->dev, "%s: led: %u, duty: %u", __func__, led_idx, duty);
+	glb_data.duty_buf[duty_offset] = duty;
 
 	/* Write the ARG_END and MSA; as well as the MDA,
 	 * since it's in the middle */
@@ -869,7 +858,7 @@ static int load_sdma_fade(struct imx_pwm_led *self, uint fade_idx)
 	if ((ret = open_fade(self, fade_idx))) {
 		return ret;
 	}
-	fade = &led_data.fades[fade_idx];
+	fade = &glb_data.fades[fade_idx];
 
 	if (fade->len == 0) {
 		dev_warn(self->dev, "%s: fade %u: len %u < %u", __func__,
@@ -926,7 +915,7 @@ static int load_sdma_cue(struct imx_pwm_led *self, uint cue_idx)
 	if ((ret = open_cue(self, cue_idx))) {
 		return ret;
 	}
-	cue = &led_data.cues[cue_idx];
+	cue = &glb_data.cues[cue_idx];
 
 	if (cue->len == 0) {
 		dev_warn(self->dev, "%s: cue %u: len == 0", __func__, cue_idx);
@@ -947,15 +936,15 @@ static int load_sdma_cue(struct imx_pwm_led *self, uint cue_idx)
 		uint led_idx = item->led_idx;
 		uint type = item->type & 0x0F;
 		struct imx_pwm_led *led;
-		if (led_idx >= led_data.num_leds) {
+		if (led_idx >= glb_data.num_leds) {
 			dev_warn(self->dev,
 				 "%s: cue %u: item %u: "
 				 "led_idx %u >= num_leds %u",
 				 __func__, cue_idx, i, led_idx,
-				 led_data.num_leds);
+				 glb_data.num_leds);
 			return -EFAULT;
 		}
-		led = led_data.leds[led_idx];
+		led = glb_data.leds[led_idx];
 		if (am_not_owner(led->owner_pid)) {
 			dev_warn(self->dev, "%s: led %u is owned by pid %d",
 				 __func__, led_idx, led->owner_pid);
@@ -1064,12 +1053,12 @@ static int imx_pwm_led_dev_close(struct inode *inode, struct file *filp)
 	dev_dbg(dev, "close: " DEVICE_PATH "%s", self->dev_name);
 	/* Automatically close any fades and cues that were opened: */
 	for (i = 0; i < max_fades; i++) {
-		if (led_data.fades[i].owner_pid == self->owner_pid) {
+		if (glb_data.fades[i].owner_pid == self->owner_pid) {
 			close_fade(self, i);
 		}
 	}
 	for (i = 0; i < max_cues; i++) {
-		if (led_data.cues[i].owner_pid == self->owner_pid) {
+		if (glb_data.cues[i].owner_pid == self->owner_pid) {
 			close_cue(self, i);
 		}
 	}
@@ -1098,7 +1087,7 @@ static ssize_t imx_pwm_led_dev_write(struct file *filp, const char __user *data,
 		if ((ret = open_cue(self, self->open_object_idx))) {
 			return ret;
 		}
-		cue = &led_data.cues[self->open_object_idx];
+		cue = &glb_data.cues[self->open_object_idx];
 		if (!self->writing) {
 			self->writing = 1;
 			cue->len = 0;
@@ -1126,7 +1115,7 @@ static ssize_t imx_pwm_led_dev_write(struct file *filp, const char __user *data,
 		if ((ret = open_fade(self, self->open_object_idx))) {
 			return ret;
 		}
-		fade = &led_data.fades[self->open_object_idx];
+		fade = &glb_data.fades[self->open_object_idx];
 		if (!self->writing) {
 			self->writing = 1;
 			fade->len = 0;
@@ -1179,7 +1168,7 @@ static loff_t imx_pwm_led_dev_llseek(struct file *filp, loff_t off, int whence)
 			return ret;
 		}
 		dev_dbg(dev, "seek: cue %u", self->open_object_idx);
-		led_data.cues[self->open_object_idx].len = 0;
+		glb_data.cues[self->open_object_idx].len = 0;
 		break;
 	}
 	case OPEN_OBJECT_TYPE_FADE: {
@@ -1188,7 +1177,7 @@ static loff_t imx_pwm_led_dev_llseek(struct file *filp, loff_t off, int whence)
 			return ret;
 		}
 		dev_dbg(dev, "seek: fade %u", self->open_object_idx);
-		led_data.fades[self->open_object_idx].len = 0;
+		glb_data.fades[self->open_object_idx].len = 0;
 		break;
 	}
 	case OPEN_OBJECT_TYPE_NONE:
@@ -1496,14 +1485,14 @@ MODULE_DEVICE_TABLE(of, imx_pwm_led_dt_ids);
 static int imx_pwm_led_probe(struct platform_device *pdev)
 {
 	uint i;
-	uint led_idx = led_data.num_leds;
+	uint led_idx = glb_data.num_leds;
 	const struct of_device_id *of_id =
 		of_match_device(imx_pwm_led_dt_ids, &pdev->dev);
 	struct imx_pwm_led *self;
 	struct resource *r;
 	int ret;
 	struct device_node *epit_np = NULL;
-	u32 sdma_params[2];
+	u32 sdma_channel;
 
 	if (!of_id) {
 		return -ENODEV;
@@ -1528,47 +1517,47 @@ static int imx_pwm_led_probe(struct platform_device *pdev)
 	/* If this is the first device, allocate the global data and contiguous
 	 * duty and fade buffers */
 	if (led_idx == 0) {
-		led_data.leds = kzalloc(max_leds * sizeof(struct imx_pwm_led *),
+		glb_data.leds = kzalloc(max_leds * sizeof(struct imx_pwm_led *),
 					GFP_KERNEL);
-		if (led_data.leds == NULL) {
+		if (glb_data.leds == NULL) {
 			dev_err(&pdev->dev, "probe: failed to allocate memory");
 			return -ENOMEM;
 		}
-		led_data.fades = kzalloc(max_fades * sizeof(struct led_fade),
+		glb_data.fades = kzalloc(max_fades * sizeof(struct led_fade),
 					 GFP_KERNEL);
-		if (led_data.fades == NULL) {
+		if (glb_data.fades == NULL) {
 			dev_err(&pdev->dev, "probe: failed to allocate memory");
 			ret = -ENOMEM;
 			goto probe_failed_alloc_fades;
 		}
 		for (i = 0; i < max_fades; i++) {
-			mutex_init(&led_data.fades[i].lock);
+			mutex_init(&glb_data.fades[i].lock);
 		}
-		led_data.cues =
+		glb_data.cues =
 			kzalloc(max_cues * sizeof(struct led_cue), GFP_KERNEL);
-		if (led_data.cues == NULL) {
+		if (glb_data.cues == NULL) {
 			dev_err(&pdev->dev, "probe: failed to allocate memory");
 			ret = -ENOMEM;
 			goto probe_failed_alloc_cues;
 		}
 		for (i = 0; i < max_cues; i++) {
-			mutex_init(&led_data.cues[i].lock);
+			mutex_init(&glb_data.cues[i].lock);
 		}
 		for (i = 0; i < max_cues; i++) {
-			led_data.cues[i].items =
+			glb_data.cues[i].items =
 				kzalloc(get_max_cue_size(), GFP_KERNEL);
-			if (led_data.cues[i].items == NULL) {
+			if (glb_data.cues[i].items == NULL) {
 				dev_err(&pdev->dev,
 					"probe: failed to allocate memory");
 				ret = -ENOMEM;
 				goto probe_failed_cue_items_alloc;
 			}
 		}
-		led_data.duty_buf = dma_zalloc_coherent(&pdev->dev,
+		glb_data.duty_buf = dma_zalloc_coherent(&pdev->dev,
 							get_duty_buf_size(),
-							&led_data.duty_buf_phys,
+							&glb_data.duty_buf_phys,
 							GFP_KERNEL);
-		if (led_data.duty_buf == NULL) {
+		if (glb_data.duty_buf == NULL) {
 			dev_err(&pdev->dev,
 				"probe: failed to allocate duty buffer");
 			ret = -ENOMEM;
@@ -1576,9 +1565,9 @@ static int imx_pwm_led_probe(struct platform_device *pdev)
 		}
 		dev_dbg(&pdev->dev,
 			"probe: allocated %u byte duty buffer at 0x%08x",
-			get_duty_buf_size(), led_data.duty_buf_phys);
+			get_duty_buf_size(), glb_data.duty_buf_phys);
 		for (i = 0; i < max_fades; i++) {
-			struct led_fade *fade = &led_data.fades[i];
+			struct led_fade *fade = &glb_data.fades[i];
 			fade->buf = dma_zalloc_coherent(&pdev->dev,
 							max_fade_size,
 							&fade->buf_phys,
@@ -1597,12 +1586,12 @@ static int imx_pwm_led_probe(struct platform_device *pdev)
 		}
 	}
 
-	if (led_data.leds[led_idx] != NULL) {
+	if (glb_data.leds[led_idx] != NULL) {
 		dev_err(&pdev->dev, "probe: device already exists");
 		ret = -EFAULT;
 		goto probe_failed_already_exists;
 	}
-	led_data.leds[led_idx] = self;
+	glb_data.leds[led_idx] = self;
 
 	self->clk_per = devm_clk_get(&pdev->dev, "per");
 	if (IS_ERR(self->clk_per)) {
@@ -1642,9 +1631,9 @@ static int imx_pwm_led_probe(struct platform_device *pdev)
 	}
 
 	/* Set up the EPIT */
-	epit_np = of_parse_phandle(pdev->dev.of_node, "timer", 0);
+	epit_np = of_parse_phandle(pdev->dev.of_node, "unu,timer", 0);
 	if (IS_ERR(epit_np)) {
-		dev_err(&pdev->dev, "probe: no timer specified");
+		dev_err(&pdev->dev, "probe: unu,timer property not specified");
 		ret = -ENODEV;
 		goto probe_failed_epit_init;
 	}
@@ -1664,15 +1653,27 @@ static int imx_pwm_led_probe(struct platform_device *pdev)
 	 * yet, as all channels are disabled */
 	epit_start_hz(self->epit, sample_rate);
 
-	/* Read SDMA channel number and load address */
-	if (of_property_read_u32_array(pdev->dev.of_node, "sdma-params",
-				       sdma_params, ARRAY_SIZE(sdma_params))) {
+	/* For the first device, read the SDMA script origin: */
+	if (led_idx == 0) {
+		u32 sdma_script_origin;
+		if (of_property_read_u32(pdev->dev.of_node,
+					 "unu,sdma-script-origin",
+					 &sdma_script_origin)) {
+			dev_err(&pdev->dev,
+				"probe: unu,sdma-script-origin property not "
+				"specified");
+			goto probe_failed_sdma_init;
+		}
+		glb_data.sdma_script_origin = sdma_script_origin;
+	}
+	/* Read SDMA channel number */
+	if (of_property_read_u32(pdev->dev.of_node, "unu,sdma-channel",
+				 &sdma_channel)) {
 		dev_err(&pdev->dev,
-			"probe: sdma-params property not specified");
+			"probe: unu,sdma-channel property not specified");
 		goto probe_failed_sdma_init;
 	}
-	self->sdma_ch_num = sdma_params[0];
-	self->sdma_script_origin = sdma_params[1];
+	self->sdma_ch_num = sdma_channel;
 
 	/* Set up SDMA and get a channel reference */
 	self->sdma = sdma_engine_get();
@@ -1688,9 +1689,11 @@ static int imx_pwm_led_probe(struct platform_device *pdev)
 		goto probe_failed_sdma_init;
 	}
 
-	/* Load the SDMA script */
-	if ((ret = load_sdma_script(self))) {
-		goto probe_failed_load_sdma_script;
+	/* For the first device, load the SDMA script: */
+	if (led_idx == 0) {
+		if ((ret = load_sdma_script(self))) {
+			goto probe_failed_load_sdma_script;
+		}
 	}
 	if ((ret = load_sdma_initial_context(self))) {
 		goto probe_failed_load_sdma_script;
@@ -1715,7 +1718,7 @@ static int imx_pwm_led_probe(struct platform_device *pdev)
 	if ((ret = config_pwm(self, pwm_period, pwm_prescaler, pwm_invert))) {
 		goto probe_failed_pwm_enable;
 	}
-	led_data.num_leds++;
+	glb_data.num_leds++;
 	return 0;
 
 probe_failed_pwm_enable:
@@ -1732,13 +1735,13 @@ probe_failed_get_clk:
 probe_failed_already_exists:
 probe_failed_fade_alloc:
 	if (led_idx == 0) {
-		if (led_data.duty_buf != NULL) {
+		if (glb_data.duty_buf != NULL) {
 			dma_free_coherent(&pdev->dev, get_duty_buf_size(),
-					  led_data.duty_buf,
-					  led_data.duty_buf_phys);
+					  glb_data.duty_buf,
+					  glb_data.duty_buf_phys);
 		}
 		for (i = 0; i < max_fades; i++) {
-			const struct led_fade *fade = &led_data.fades[i];
+			const struct led_fade *fade = &glb_data.fades[i];
 			if (fade->buf != NULL) {
 				dma_free_coherent(&pdev->dev, max_fade_size,
 						  fade->buf, fade->buf_phys);
@@ -1748,21 +1751,21 @@ probe_failed_fade_alloc:
 probe_failed_cue_items_alloc:
 	if (led_idx == 0) {
 		for (i = 0; i < max_cues; i++) {
-			mutex_destroy(&led_data.cues[i].lock);
-			kfree(led_data.cues[i].items);
+			mutex_destroy(&glb_data.cues[i].lock);
+			kfree(glb_data.cues[i].items);
 		}
-		kfree(led_data.cues);
+		kfree(glb_data.cues);
 	}
 probe_failed_alloc_cues:
 	if (led_idx == 0) {
 		for (i = 0; i < max_fades; i++) {
-			mutex_destroy(&led_data.fades[i].lock);
+			mutex_destroy(&glb_data.fades[i].lock);
 		}
-		kfree(led_data.fades);
+		kfree(glb_data.fades);
 	}
 probe_failed_alloc_fades:
 	if (led_idx == 0) {
-		kfree(led_data.leds);
+		kfree(glb_data.leds);
 	}
 	return ret;
 }
@@ -1778,20 +1781,20 @@ static int imx_pwm_led_remove(struct platform_device *pdev)
 	if (self->led_idx == 0) {
 		uint i;
 		dma_free_coherent(&pdev->dev, get_duty_buf_size(),
-				  led_data.duty_buf, led_data.duty_buf_phys);
+				  glb_data.duty_buf, glb_data.duty_buf_phys);
 		for (i = 0; i < max_fades; i++) {
-			const struct led_fade *fade = &led_data.fades[i];
+			const struct led_fade *fade = &glb_data.fades[i];
 			dma_free_coherent(&pdev->dev, max_fade_size, fade->buf,
 					  fade->buf_phys);
 			mutex_destroy(&fade->lock);
 		}
-		kfree(led_data.fades);
+		kfree(glb_data.fades);
 		for (i = 0; i < max_cues; i++) {
-			mutex_destroy(&led_data.cues[i].lock);
-			kfree(led_data.cues[i].items);
+			mutex_destroy(&glb_data.cues[i].lock);
+			kfree(glb_data.cues[i].items);
 		}
-		kfree(led_data.cues);
-		kfree(led_data.leds);
+		kfree(glb_data.cues);
+		kfree(glb_data.leds);
 	}
 	mutex_destroy(&self->lock);
 	return 0;
@@ -1880,11 +1883,11 @@ static int __init imx_pwm_led_init(void)
 	/* Enable all PWM channels at the same time, inserting the phase offset
 	 * delay when configured: */
 	local_irq_disable();
-	for (i = 0; i < led_data.num_leds; i++) {
+	for (i = 0; i < glb_data.num_leds; i++) {
 		if (i > 0) {
 			udelay(pwm_phase_offset);
 		}
-		enable_pwm(led_data.leds[i]);
+		enable_pwm(glb_data.leds[i]);
 	}
 	local_irq_enable();
 
