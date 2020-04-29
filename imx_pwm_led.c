@@ -205,17 +205,17 @@ struct led_cue {
 
 /** Module global data struct */
 struct glb_data {
-	/** Array of leds */
+	/** Array of LEDs */
 	struct imx_pwm_led **leds;
 	/** Array of fades */
 	struct led_fade *fades;
 	/** Array of cues */
 	struct led_cue *cues;
-	/** Buffer of duty cycles (max_cues x max_leds) */
+	/** Buffer of duty cycles [(max_cues + 1) * max_leds] */
 	u16 *duty_buf;
 	/** Physical address of duty buffer for the SDMA */
 	dma_addr_t duty_buf_phys;
-	/** Number of configured leds */
+	/** Number of configured LEDs */
 	uint num_leds;
 	/** Pointer to the timer used to drive the DMA engine */
 	struct epit *epit;
@@ -380,7 +380,7 @@ static int config_pwm(struct imx_pwm_led *self, u32 period, u32 prescaler,
 	return 0;
 }
 
-static void enable_pwm(struct imx_pwm_led *self)
+static inline void enable_pwm(struct imx_pwm_led *self)
 {
 	u32 cr = __raw_readl(self->mmio_base + PWMCR);
 	cr |= PWMCR_EN;
@@ -878,8 +878,7 @@ static int load_sdma_fade(struct imx_pwm_led *self, uint fade_idx)
 	if (self->adaptive) {
 		int ret;
 		uint duty;
-		/* Fetch the current duty cycle from the SDMA, in case the LED
-		 * is inactive, in which case the actual PWM duty will be 0%: */
+		/* Fetch the current duty cycle from the SDMA: */
 		if ((ret = fetch_sdma_duty(self, &duty))) {
 			return ret;
 		}
@@ -993,7 +992,7 @@ static int set_sdma_active(struct imx_pwm_led *self, int active)
 	return 0;
 }
 
-static int is_sdma_playing(struct imx_pwm_led *self)
+static int fetch_sdma_status(struct imx_pwm_led *self)
 {
 	struct sdma_context_data context = { { 0 } };
 	/* Fetch the current MSA and end addresses: */
@@ -1004,6 +1003,7 @@ static int is_sdma_playing(struct imx_pwm_led *self)
 	if (ret) {
 		dev_err(self->dev, "%s: failed to fetch context", __func__);
 	}
+	/* Return 1 if playing, and zero if not: */
 	ret = context.msa < context.gReg[ARG_END];
 	dev_dbg(self->dev, "%s: %d", __func__, ret);
 	return ret;
@@ -1281,7 +1281,7 @@ static long ioctl_set_duty(struct imx_pwm_led *self, unsigned long arg)
 	}
 	/* Use the SDMA to load the duty rather than setting it directly.
 	 * This will take into account whether the LED is active and allow
-	 * adaptation of a following fade, even when inactive: */
+	 * adaptation of a following fade: */
 	if ((ret = load_sdma_duty(self, max_cues, self->led_idx, arg))) {
 		return ret;
 	}
@@ -1292,8 +1292,7 @@ static long ioctl_get_duty(struct imx_pwm_led *self, unsigned long arg)
 {
 	long ret;
 	uint duty;
-	/* Fetch the current duty cycle from the SDMA, in case the LED is
-	 * inactive, in which case the actual PWM duty will be 0%: */
+	/* Fetch the current duty cycle from the SDMA: */
 	if ((ret = fetch_sdma_duty(self, &duty))) {
 		return ret;
 	}
@@ -1310,18 +1309,19 @@ static long ioctl_set_active(struct imx_pwm_led *self, unsigned long arg)
 	uint duty;
 	int ret;
 	dev_dbg(self->dev, "ioctl: SET_ACTIVE: %lu", arg);
+	/* Set the active flag: */
 	if ((ret = set_sdma_active(self, arg != 0))) {
 		return ret;
 	}
-	/* Fetch the playing status: */
-	ret = is_sdma_playing(self);
+	/* Fetch the SDMA status: */
+	ret = fetch_sdma_status(self);
 	/* If there was an error getting the status: */
 	if (ret < 0) {
 		return ret;
 	}
 	/* If the LED is currently playing: */
 	if (ret) {
-		/* The SDMA will set the actual duty: */
+		/* The SDMA will set the PWM duty: */
 		return 0;
 	}
 
@@ -1365,13 +1365,13 @@ static long ioctl_play_cue(struct imx_pwm_led *self, unsigned long arg)
 	int ret;
 	uint led_mask;
 	dev_dbg(self->dev, "ioctl: PLAY_CUE: %lu", arg);
-	/* 1. Get the leds in the cue */
+	/* 1. Get the LEDs in the cue */
 	if ((ret = get_cue_led_mask(self, arg, &led_mask))) {
 		return ret;
 	}
-	/* 2. Lock the leds except our own, which was already locked */
+	/* 2. Lock the LEDs except our own, which was already locked */
 	lock_leds(led_mask & ~(1 << self->led_idx));
-	/* 3. Stop the leds */
+	/* 3. Stop the LEDs */
 	if ((ret = stop_cue(self, led_mask))) {
 		goto ioctl_play_cue_exit;
 	}
@@ -1379,10 +1379,10 @@ static long ioctl_play_cue(struct imx_pwm_led *self, unsigned long arg)
 	if ((ret = load_sdma_cue(self, arg))) {
 		goto ioctl_play_cue_exit;
 	}
-	/* 5. Start the leds */
+	/* 5. Start the LEDs */
 	ret = start_cue(self, led_mask);
 ioctl_play_cue_exit:
-	/* 6. Unlock the leds except our own, which will be unlocked later */
+	/* 6. Unlock the LEDs except our own, which will be unlocked later */
 	unlock_leds(led_mask & ~(1 << self->led_idx));
 	return ret;
 }
@@ -1404,18 +1404,18 @@ static long ioctl_stop_cue(struct imx_pwm_led *self, unsigned long arg)
 	int ret;
 	uint led_mask;
 	dev_dbg(self->dev, "ioctl: STOP_CUE: %lu", arg);
-	/* 1. Get the leds in the cue */
+	/* 1. Get the LEDs in the cue */
 	if ((ret = get_cue_led_mask(self, arg, &led_mask))) {
 		return ret;
 	}
-	/* 2. Lock the leds except our own, which was already locked */
+	/* 2. Lock the LEDs except our own, which was already locked */
 	lock_leds(led_mask & ~(1 << self->led_idx));
-	/* 3. Stop the leds */
+	/* 3. Stop the LEDs */
 	if ((ret = stop_cue(self, led_mask))) {
 		goto ioctl_play_cue_exit;
 	}
 ioctl_play_cue_exit:
-	/* 4. Unlock the leds except our own, which will be unlocked later */
+	/* 4. Unlock the LEDs except our own, which will be unlocked later */
 	unlock_leds(led_mask & ~(1 << self->led_idx));
 	return ret;
 }
