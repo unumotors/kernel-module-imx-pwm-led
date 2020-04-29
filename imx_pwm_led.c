@@ -47,8 +47,6 @@
 #include <linux/types.h>
 
 // FIXME: Implement the active functionality
-// FIXME: Tidy up sdma script: jmps, when starting should probably throw away the first event since
-//        the pending will mean that the following EPIT triggered event is not equidistant.
 // FIXME: There's no need to load 8 copies of the script, it can just be loaded once by the first channel.
 //        So it would be worth having different DT properties for channel and script address - latter only needed for channel 0.
 //        Also remember to prefix the custom DT properties with 'unu,'
@@ -262,9 +260,9 @@ module_param(sdma_priority,    uint, 0);
 /** Device global data, shared between all devices */
 static struct led_data led_data;
 
-static const u32 sdma_script[] = { 0x0a000901, 0x69c80400, 0x69c86a2b,
-				   0x630003df, 0x7d05620a, 0x6a2b0400,
-				   0x01607df6, 0x03000400, 0x01607df2 };
+static const u32 sdma_script[] = { 0x0a000901, 0x69c80400, 0x69c86300,
+				   0x03df7d04, 0x620a6a2b, 0x01607df7,
+				   0x03000160, 0x7df40000 };
 
 /*******************************************************************************
  * UTILITY FUNCTIONS
