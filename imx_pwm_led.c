@@ -665,7 +665,7 @@ static void find_fade_dir(struct imx_pwm_led *self, struct led_fade *fade,
 		uint last_val = *(itr - 1);
 		if (val > last_val) {
 			if (fade->dir == FADE_DIR_UNKNOWN) {
-				dev_dbg(self->dev, "%s: dir: inc", __func__);
+				dev_dbg(self->dev, "%s: inc", __func__);
 				fade->dir = FADE_DIR_INCREASING;
 			} else if (fade->dir != FADE_DIR_INCREASING) {
 				dev_dbg(self->dev,
@@ -678,7 +678,7 @@ static void find_fade_dir(struct imx_pwm_led *self, struct led_fade *fade,
 			}
 		} else if (val < last_val) {
 			if (fade->dir == FADE_DIR_UNKNOWN) {
-				dev_dbg(self->dev, "%s: dir: dec", __func__);
+				dev_dbg(self->dev, "%s: dec", __func__);
 				fade->dir = FADE_DIR_DECREASING;
 			} else if (fade->dir != FADE_DIR_DECREASING) {
 				dev_dbg(self->dev,
@@ -699,11 +699,11 @@ static void find_fade_dir(struct imx_pwm_led *self, struct led_fade *fade,
 static uint adapt_fade(struct imx_pwm_led *self, const struct led_fade *fade,
 		       uint current_duty)
 {
-	int l = 0;
-	int r = (fade->len / sizeof(u16)) - 1;
-	int m = 0;
+	uint len = fade->len / sizeof(u16);
+	uint l = 0;
+	uint r = len;
 	uint val;
-	if (r < 0) {
+	if (len == 0) {
 		dev_warn(self->dev, "%s: no data", __func__);
 		return 0;
 	}
@@ -713,31 +713,32 @@ static uint adapt_fade(struct imx_pwm_led *self, const struct led_fade *fade,
 		dev_warn(self->dev, "%s: non-monotonic", __func__);
 		return 0;
 	}
-	/* Binary search: */
-	while (l <= r) {
-		m = (l + r) / 2;
+	/* Binary search for leftmost value with the current duty: */
+	while (l < r) {
+		uint m = (l + r) / 2;
 		val = ((const u16 *)fade->buf)[m];
 		if ((fade->dir == FADE_DIR_INCREASING) ? (val < current_duty) :
 							 (val > current_duty)) {
 			l = m + 1;
-		} else if ((fade->dir == FADE_DIR_INCREASING) ?
-				   (val > current_duty) :
-				   (val < current_duty)) {
-			r = m - 1;
 		} else {
-			break;
+			r = m;
 		}
 	}
+	/* If the current duty is larger than all of the values: */
+	if (l >= len) {
+		/* Use the last value: */
+		l = len - 1;
+	}
 	/* If an adaptation is being made: */
-	if (m != 0) {
+	if (l != 0) {
 		dev_dbg(self->dev,
 			"%s: dir: %s, old_duty: %u, new_idx: %u, new_duty: %u",
 			__func__,
 			(fade->dir == FADE_DIR_INCREASING) ? "inc" : "dec",
-			current_duty, (uint)m, val);
+			current_duty, l, val);
 	}
 	/* Return byte offset: */
-	return (uint)m * sizeof(u16);
+	return l * sizeof(u16);
 }
 
 /*******************************************************************************
