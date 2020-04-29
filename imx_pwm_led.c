@@ -49,7 +49,6 @@
 // FIXME: Implement the active functionality
 // FIXME: Tidy up sdma script: jmps, when starting should probably throw away the first event since
 //        the pending will mean that the following EPIT triggered event is not equidistant.
-// FIXME: Implement the adaptive functionality, with binary search
 // FIXME: There's no need to load 8 copies of the script, it can just be loaded once by the first channel.
 //        So it would be worth having different DT properties for channel and script address - latter only needed for channel 0.
 //        Also remember to prefix the custom DT properties with 'unu,'
@@ -62,8 +61,9 @@
 /* clang-format off */
 #define DEVICE_PATH           "/dev/"
 #define DEVICE_NAME           "pwm_led"
-#define ARG_ACTIVE            6 /* SDMA script arg 'active': register 6 */
-#define ARG_END               7 /* SDMA script arg 'end': register 7 */
+#define ARG_DUTY              2 /* SDMA output arg 'duty': register 2 */
+#define ARG_ACTIVE            6 /* SDMA input arg 'active': register 6 */
+#define ARG_END               7 /* SDMA input arg 'end': register 7 */
 #define DEFAULT_ACTIVE        1 /* Default 'active' value: true */
 #define DEFAULT_ADAPTIVE      0 /* Default 'adaptive' value: false */
 #define MAX_PWM_PRESCALER     4095
@@ -263,7 +263,7 @@ module_param(sdma_priority,    uint, 0);
 static struct led_data led_data;
 
 static const u32 sdma_script[] = { 0x0a000901, 0x69c80400, 0x69c86a2b,
-				   0x620002df, 0x7d05620a, 0x6a2b0400,
+				   0x630003df, 0x7d05620a, 0x6a2b0400,
 				   0x01607df6, 0x03000400, 0x01607df2 };
 
 /*******************************************************************************
@@ -280,9 +280,14 @@ static inline int am_not_owner(pid_t owner_pid)
 	return (owner_pid != 0) && (owner_pid != get_my_pid());
 }
 
-static inline uint get_max_cue_size(void)
+static uint get_max_cue_size(void)
 {
 	return max_leds * sizeof(struct led_cue_item);
+}
+
+static uint get_duty_buf_size(void)
+{
+	return sizeof(u16) * max_leds * (max_cues + 1);
 }
 
 static void lock_leds(uint led_mask)
@@ -394,16 +399,6 @@ static void disable_pwm(struct imx_pwm_led *self)
 	/* Release clocks */
 	clk_disable_unprepare(self->clk_per);
 	clk_disable_unprepare(self->clk_ipg);
-}
-
-static inline void set_pwm_duty(struct imx_pwm_led *self, uint duty)
-{
-	__raw_writel(duty, self->mmio_base + PWMSAR);
-}
-
-static inline uint get_pwm_duty(struct imx_pwm_led *self)
-{
-	return __raw_readl(self->mmio_base + PWMSAR);
 }
 
 /*******************************************************************************
@@ -672,12 +667,12 @@ static void find_fade_dir(struct imx_pwm_led *self, struct led_fade *fade,
 		uint last_val = *(itr - 1);
 		if (val > last_val) {
 			if (fade->dir == FADE_DIR_UNKNOWN) {
-				dev_dbg(self->dev, "%s: increasing", __func__);
+				dev_dbg(self->dev, "%s: dir: inc", __func__);
 				fade->dir = FADE_DIR_INCREASING;
 			} else if (fade->dir != FADE_DIR_INCREASING) {
 				dev_dbg(self->dev,
-					"%s: non-monotonic at sample %u",
-					__func__, itr - (const u16 *)fade->buf);
+					"%s: non-monotonic at idx %u", __func__,
+					itr - (const u16 *)fade->buf);
 				fade->dir = FADE_DIR_NON_MONOTONIC;
 				break;
 			} else {
@@ -685,12 +680,12 @@ static void find_fade_dir(struct imx_pwm_led *self, struct led_fade *fade,
 			}
 		} else if (val < last_val) {
 			if (fade->dir == FADE_DIR_UNKNOWN) {
-				dev_dbg(self->dev, "%s: decreasing", __func__);
+				dev_dbg(self->dev, "%s: dir: dec", __func__);
 				fade->dir = FADE_DIR_DECREASING;
 			} else if (fade->dir != FADE_DIR_DECREASING) {
 				dev_dbg(self->dev,
-					"%s: non-monotonic at sample %u",
-					__func__, itr - (const u16 *)fade->buf);
+					"%s: non-monotonic at idx %u", __func__,
+					itr - (const u16 *)fade->buf);
 				fade->dir = FADE_DIR_NON_MONOTONIC;
 				break;
 			} else {
@@ -717,7 +712,7 @@ static uint adapt_fade(struct imx_pwm_led *self, const struct led_fade *fade,
 	/* If the direction is unknown or non-monotonic: */
 	if ((fade->dir != FADE_DIR_INCREASING) &&
 	    (fade->dir != FADE_DIR_DECREASING)) {
-		dev_warn(self->dev, "%s: non-monotonic fade", __func__);
+		dev_warn(self->dev, "%s: non-monotonic", __func__);
 		return 0;
 	}
 	/* Binary search: */
@@ -738,11 +733,9 @@ static uint adapt_fade(struct imx_pwm_led *self, const struct led_fade *fade,
 	/* If an adaptation is being made: */
 	if (m != 0) {
 		dev_dbg(self->dev,
-			"%s: dir: %s, current_duty: %u, nearest_idx: %u, "
-			"nearest_duty: %u",
+			"%s: dir: %s, old_duty: %u, new_idx: %u, new_duty: %u",
 			__func__,
-			(fade->dir == FADE_DIR_INCREASING) ? "increasing" :
-							     "decreasing",
+			(fade->dir == FADE_DIR_INCREASING) ? "inc" : "dec",
 			current_duty, (uint)m, val);
 	}
 	/* Return byte offset: */
@@ -815,6 +808,54 @@ static int load_sdma_initial_context(struct imx_pwm_led *self)
 	return 0;
 }
 
+static int load_sdma_duty(struct imx_pwm_led *self, uint cue_idx, uint led_idx,
+			  uint duty)
+{
+	int ret;
+	struct sdma_context_data context = { { 0 } };
+	uint duty_offset = (cue_idx * max_leds) + led_idx;
+	dma_addr_t duty_phys =
+		led_data.duty_buf_phys + (duty_offset * sizeof(u16));
+	dev_dbg(self->dev, "%s: cue: %u, led: %u, duty: %u", __func__, cue_idx,
+		led_idx, duty);
+	led_data.duty_buf[duty_offset] = duty;
+
+	/* Write the ARG_END and MSA; as well as the MDA,
+	 * since it's in the middle */
+	context.gReg[ARG_END] = duty_phys + sizeof(u16);
+	context.mda = self->mmio_base_phys + PWMSAR;
+	context.msa = duty_phys;
+
+	/* This operation is run by channel 0, which is mutually exclusive with
+	 * our scripts's channel. Since only one channel is running at a time,
+	 * and channels cannot preempt each other, this ensures that the context
+	 * is only updated between iterations of our script. (i.e. registers
+	 * won't get suddenly updated while our script is running) */
+	ret = sdma_load_partial_context(
+		self->sdmac, (struct sdma_context_data *)&context.gReg[ARG_END],
+		offsetof(struct sdma_context_data, gReg[ARG_END]),
+		12); /* 3 * sizeof(u32) = 12 bytes */
+	if (ret) {
+		dev_err(self->dev, "%s: failed to load context", __func__);
+		return ret;
+	}
+	return 0;
+}
+
+static int fetch_sdma_duty(struct imx_pwm_led *self, uint *duty)
+{
+	int ret = sdma_fetch_partial_context(self->sdmac, duty,
+					     offsetof(struct sdma_context_data,
+						      gReg[ARG_DUTY]),
+					     4); /* sizeof(u32) = 4 bytes */
+	if (ret) {
+		dev_err(self->dev, "%s: failed to fetch context", __func__);
+		return ret;
+	}
+	dev_dbg(self->dev, "%s: %u", __func__, *duty);
+	return 0;
+}
+
 static int load_sdma_fade(struct imx_pwm_led *self, uint fade_idx)
 {
 	int ret;
@@ -841,8 +882,19 @@ static int load_sdma_fade(struct imx_pwm_led *self, uint fade_idx)
 		return -EFAULT;
 	}
 
+	/* If the adaptive behaviour is enabled (starting a new fade while an
+	 * existing one is running results in the new fade starting from the
+	 * nearest duty cycle to the current one): */
 	if (self->adaptive) {
-		offset = adapt_fade(self, fade, get_pwm_duty(self));
+		int ret;
+		uint duty;
+		/* Fetch the current duty cycle from the SDMA, in case the LED
+		 * is inactive, in which case the actual PWM duty will be 0%: */
+		if ((ret = fetch_sdma_duty(self, &duty))) {
+			return ret;
+		}
+		/* Adapt the starting offset of the fade: */
+		offset = adapt_fade(self, fade, duty);
 	}
 
 	/* Write the ARG_END and MSA; as well as the MDA,
@@ -850,40 +902,6 @@ static int load_sdma_fade(struct imx_pwm_led *self, uint fade_idx)
 	context.gReg[ARG_END] = fade->buf_phys + fade->len;
 	context.mda = self->mmio_base_phys + PWMSAR;
 	context.msa = fade->buf_phys + offset;
-
-	/* This operation is run by channel 0, which is mutually exclusive with
-	 * our scripts's channel. Since only one channel is running at a time,
-	 * and channels cannot preempt each other, this ensures that the context
-	 * is only updated between iterations of our script. (i.e. registers
-	 * won't get suddenly updated while our script is running) */
-	ret = sdma_load_partial_context(
-		self->sdmac, (struct sdma_context_data *)&context.gReg[ARG_END],
-		offsetof(struct sdma_context_data, gReg[ARG_END]),
-		12); /* 3 * sizeof(u32) = 12 bytes */
-	if (ret) {
-		dev_err(self->dev, "%s: failed to load context", __func__);
-		return ret;
-	}
-	return 0;
-}
-
-static int load_sdma_duty(struct imx_pwm_led *self, uint cue_idx, uint led_idx,
-			  uint duty)
-{
-	int ret;
-	struct sdma_context_data context = { { 0 } };
-	uint duty_offset = (cue_idx * max_leds) + led_idx;
-	dma_addr_t duty_phys =
-		led_data.duty_buf_phys + (duty_offset * sizeof(u16));
-	dev_dbg(self->dev, "%s: cue: %u, led: %u, duty: %u", __func__, cue_idx,
-		led_idx, duty);
-	led_data.duty_buf[duty_offset] = duty;
-
-	/* Write the ARG_END and MSA; as well as the MDA,
-	 * since it's in the middle */
-	context.gReg[ARG_END] = duty_phys + sizeof(u16);
-	context.mda = self->mmio_base_phys + PWMSAR;
-	context.msa = duty_phys;
 
 	ret = sdma_load_partial_context(
 		self->sdmac, (struct sdma_context_data *)&context.gReg[ARG_END],
@@ -1255,14 +1273,24 @@ static long ioctl_set_duty(struct imx_pwm_led *self, unsigned long arg)
 	if ((ret = stop_led(self))) {
 		return ret;
 	}
-	set_pwm_duty(self, arg);
+	/* Use the SDMA to load the duty rather than setting it directly.
+	 * This will take into account whether the LED is active and allow
+	 * adaptation of a following fade, even when inactive: */
+	if ((ret = load_sdma_duty(self, max_cues, self->led_idx, arg))) {
+		return ret;
+	}
 	return 0;
 }
 
 static long ioctl_get_duty(struct imx_pwm_led *self, unsigned long arg)
 {
 	long ret;
-	uint duty = get_pwm_duty(self);
+	uint duty;
+	/* Fetch the current duty cycle from the SDMA, in case the LED is
+	 * inactive, in which case the actual PWM duty will be 0%: */
+	if ((ret = fetch_sdma_duty(self, &duty))) {
+		return ret;
+	}
 	dev_dbg(self->dev, "ioctl: GET_DUTY: %u", duty);
 	if ((ret = copy_to_user((void *)arg, &duty, sizeof(duty)))) {
 		dev_warn(self->dev, "ioctl: failed userspace copy");
@@ -1500,9 +1528,8 @@ static int imx_pwm_led_probe(struct platform_device *pdev)
 				goto probe_failed_cue_items_alloc;
 			}
 		}
-		u32 duty_buf_size = sizeof(u16) * max_leds * max_cues;
 		led_data.duty_buf = dma_zalloc_coherent(&pdev->dev,
-							duty_buf_size,
+							get_duty_buf_size(),
 							&led_data.duty_buf_phys,
 							GFP_KERNEL);
 		if (led_data.duty_buf == NULL) {
@@ -1513,7 +1540,7 @@ static int imx_pwm_led_probe(struct platform_device *pdev)
 		}
 		dev_dbg(&pdev->dev,
 			"probe: allocated %u byte duty buffer at 0x%08x",
-			duty_buf_size, led_data.duty_buf_phys);
+			get_duty_buf_size(), led_data.duty_buf_phys);
 		for (i = 0; i < max_fades; i++) {
 			struct led_fade *fade = &led_data.fades[i];
 			fade->buf = dma_zalloc_coherent(&pdev->dev,
@@ -1670,8 +1697,7 @@ probe_failed_already_exists:
 probe_failed_fade_alloc:
 	if (led_idx == 0) {
 		if (led_data.duty_buf != NULL) {
-			u32 duty_buf_size = sizeof(u16) * max_leds * max_cues;
-			dma_free_coherent(&pdev->dev, duty_buf_size,
+			dma_free_coherent(&pdev->dev, get_duty_buf_size(),
 					  led_data.duty_buf,
 					  led_data.duty_buf_phys);
 		}
@@ -1715,9 +1741,8 @@ static int imx_pwm_led_remove(struct platform_device *pdev)
 	disable_pwm(self);
 	if (self->led_idx == 0) {
 		uint i;
-		u32 duty_buf_size = sizeof(u16) * max_leds * max_cues;
-		dma_free_coherent(&pdev->dev, duty_buf_size, led_data.duty_buf,
-				  led_data.duty_buf_phys);
+		dma_free_coherent(&pdev->dev, get_duty_buf_size(),
+				  led_data.duty_buf, led_data.duty_buf_phys);
 		for (i = 0; i < max_fades; i++) {
 			const struct led_fade *fade = &led_data.fades[i];
 			dma_free_coherent(&pdev->dev, max_fade_size, fade->buf,
