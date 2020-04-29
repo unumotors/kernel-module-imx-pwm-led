@@ -702,7 +702,6 @@ static uint adapt_fade(struct imx_pwm_led *self, const struct led_fade *fade,
 	uint len = fade->len / sizeof(u16);
 	uint l = 0;
 	uint r = len;
-	uint val;
 	if (len == 0) {
 		dev_warn(self->dev, "%s: no data", __func__);
 		return 0;
@@ -716,7 +715,7 @@ static uint adapt_fade(struct imx_pwm_led *self, const struct led_fade *fade,
 	/* Binary search for leftmost value with the current duty: */
 	while (l < r) {
 		uint m = (l + r) / 2;
-		val = ((const u16 *)fade->buf)[m];
+		uint val = ((const u16 *)fade->buf)[m];
 		if ((fade->dir == FADE_DIR_INCREASING) ? (val < current_duty) :
 							 (val > current_duty)) {
 			l = m + 1;
@@ -732,10 +731,10 @@ static uint adapt_fade(struct imx_pwm_led *self, const struct led_fade *fade,
 	/* If an adaptation is being made: */
 	if (l != 0) {
 		dev_dbg(self->dev,
-			"%s: dir: %s, old_duty: %u, new_idx: %u, new_duty: %u",
+			"%s: dir: %s, idx: %u, duty: %u",
 			__func__,
 			(fade->dir == FADE_DIR_INCREASING) ? "inc" : "dec",
-			current_duty, l, val);
+			current_duty, l, ((const u16 *)fade->buf)[l]);
 	}
 	/* Return byte offset: */
 	return l * sizeof(u16);
