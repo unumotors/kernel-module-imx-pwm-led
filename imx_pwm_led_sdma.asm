@@ -1,7 +1,7 @@
 ; SPDX-License-Identifier: GPL-2.0-only
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ; i.MX PWM LED driver
-; Copyright (C) 2020 unu GmbH <opensource@unumotors.com>
+; Copyright (C) 2020 unu GmbH
 ; Written by Geoffrey Phillips.
 ;
 ; This library is free software; you can redistribute it and/or modify
