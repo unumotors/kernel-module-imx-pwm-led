@@ -162,7 +162,7 @@ struct imx_pwm_led {
 	int writing;
 	/** True if adaptive mode is enabled */
 	int adaptive;
-	/** Index of the currently playing fade, or -1 if not playing a fade */
+	/** Index of the currently playing fade, or -1 if not playing one */
 	int playing_fade_idx;
 };
 
@@ -892,16 +892,15 @@ static int load_sdma_fade(struct imx_pwm_led *self, uint fade_idx)
 		goto out;
 	}
 
-	/* Set the playing fade index and increment the fade's player count.
-	 * This will prevent any thread from writing to the fade while it is
-	 * being played. The player_count is decremented when the led is
-	 * stopped. */
+	/* Set the playing fade index and increment the fade's player_count.
+	 * This will prevent any thread from writing to it while it is being
+	 * played. The player_count is decremented when the LED is stopped. */
 	self->playing_fade_idx = fade_idx;
 	atomic_inc(&fade->player_count);
 	barrier();
 
 	/* If the adaptive behaviour is enabled (starting a new fade while an
-	 * existing one is running results in the new fade starting from the
+	 * existing one is playing results in the new fade starting from the
 	 * nearest duty cycle to the current one): */
 	if (self->adaptive) {
 		int ret;
@@ -1428,33 +1427,33 @@ static long ioctl_play_cue(struct imx_pwm_led *self, unsigned long arg)
 	uint led_mask;
 	struct led_cue *cue;
 	dev_dbg(self->dev, "ioctl: PLAY_CUE: %lu", arg);
-	/* Firstly open and lock the cue: */
+	/* 1. Firstly open and lock the cue */
 	if ((ret = open_cue(self, arg))) {
 		return ret;
 	}
 	cue = &glb_data.cues[arg];
 	mutex_lock(&cue->lock);
-	/* 1. Get the LEDs in the cue */
+	/* 2. Get the LEDs in the cue */
 	if ((ret = get_cue_led_mask(self, arg, &led_mask))) {
 		goto out_cue;
 	}
-	/* 2. Lock the LEDs except our own, which was already locked */
+	/* 3. Lock the LEDs except our own, which was already locked */
 	lock_leds(led_mask & ~(1 << self->led_idx));
-	/* 3. Stop the LEDs */
+	/* 4. Stop the LEDs */
 	if ((ret = stop_leds(self, led_mask))) {
 		goto out_led;
 	}
-	/* 4. Load the cue */
+	/* 5. Load the cue */
 	if ((ret = load_sdma_cue(self, arg))) {
 		goto out_led;
 	}
-	/* 5. Start the LEDs */
+	/* 6. Start the LEDs */
 	ret = start_cue(self, led_mask);
 out_led:
-	/* 6. Unlock the LEDs except our own, which will be unlocked later */
+	/* 7. Unlock the LEDs except our own, which will be unlocked later */
 	unlock_leds(led_mask & ~(1 << self->led_idx));
 out_cue:
-	/* Finally unlock the cue: */
+	/* 8. Finally unlock the cue */
 	mutex_unlock(&cue->lock);
 	return ret;
 }
