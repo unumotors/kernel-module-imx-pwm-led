@@ -3,8 +3,7 @@ OUT = $(MODULE_NAME).ko
 
 KERNEL_SRC ?= /usr/src/kernel
 
-# FIXME: Remove -DDEBUG
-ccflags-y += -Wno-unknown-pragmas -DDEBUG
+ccflags-y += -Wno-unknown-pragmas
 
 obj-m += $(MODULE_NAME).o
 

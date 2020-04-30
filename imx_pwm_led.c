@@ -546,11 +546,6 @@ static int get_cue_led_mask(struct imx_pwm_led *self, uint cue_idx,
 static int start_led(struct imx_pwm_led *self)
 {
 	int old_enable;
-	if (am_not_owner(self->owner_pid)) {
-		dev_warn(self->dev, "%s: led %u is owned by pid %d", __func__,
-			 self->led_idx, self->owner_pid);
-		return -EPERM;
-	}
 	/* Enable the sdma channel */
 	old_enable =
 		sdma_event_enable(self->sdmac, epit_sdma_event(glb_data.epit));
@@ -570,26 +565,14 @@ static int start_cue(struct imx_pwm_led *self, uint led_mask)
 	uint i;
 	u32 old_sdma_mask, sdma_mask, old_led_mask, started_led_mask;
 
-	for (i = 0; i < glb_data.num_leds; i++) {
-		if ((led_mask & (1 << i)) &&
-		    am_not_owner(glb_data.leds[i]->owner_pid)) {
-			dev_warn(self->dev, "%s: led %u is owned by pid %d",
-				 __func__, i, glb_data.leds[i]->owner_pid);
-			return -EPERM;
-		}
-	}
-
 	sdma_mask = convert_mask_led_to_sdma(led_mask);
 
 	/* Enable the sdma channels: */
 	old_sdma_mask = sdma_event_enable_by_channel_mask(
 		glb_data.sdma, sdma_mask, epit_sdma_event(glb_data.epit));
-	// FIXME: It would be better to already have the priority enabled, but this doesn't work as the SDMA already starts running
-	//        This must mean the EP[i] flag is already set before the EPIT event is even enabled. Is there a way to clear the
-	//        EP[i] flags? The set pending sets the flags - is it one of the registers?
+	/* Set a nonzero priority to start the script */
 	for (i = 0; i < glb_data.num_leds; i++) {
 		if (led_mask & (1 << i)) {
-			/* Set a nonzero priority to start the script */
 			sdma_set_channel_priority(glb_data.leds[i]->sdmac,
 						  sdma_priority);
 		}
@@ -638,15 +621,6 @@ static int stop_leds(struct imx_pwm_led *self, uint led_mask)
 {
 	uint i;
 	u32 old_sdma_mask, sdma_mask, old_led_mask, stopped_led_mask;
-
-	for (i = 0; i < glb_data.num_leds; i++) {
-		struct imx_pwm_led *led = glb_data.leds[i];
-		if ((led_mask & (1 << i)) && am_not_owner(led->owner_pid)) {
-			dev_warn(self->dev, "%s: led %u is owned by pid %d",
-				 __func__, i, led->owner_pid);
-			return -EPERM;
-		}
-	}
 
 	sdma_mask = convert_mask_led_to_sdma(led_mask);
 
