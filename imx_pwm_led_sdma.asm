@@ -42,8 +42,8 @@ update:
     cmphs r3, r7 ; if ($temp >= $end_address) // If playing has finished:
     bt alldone   ;     goto alldone;          // Jump to alldone
     ldf r2, 0x0a ; $duty_cycle = *MSA++;      // Get the next duty cycle (u16)
-    cmpeqi r6, 0 ; if (!$active)              // If inactive:
-    bf inactive  ;     goto inactive;         // Jump to inactive
+    cmpeqi r6, 0 ; if ($active == 0)          // If inactive:
+    bt inactive  ;     goto inactive;         // Jump to inactive
     stf r2, 0x2b ; PWMSAR = $duty             // Set the new PWM duty
     btsti r1, 0  ; if ($one & 0x01)           // If true: No relative jmp exists
     bt update    ;     goto update;           // Jump to update

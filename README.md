@@ -134,7 +134,7 @@ The devices support the following `ioctl` commands defined in `pwm_led.h`:
   will fail until the item has been closed. When the file handle of a channel is
   closed, the module automatically closes any fades or cues that were opened.
 
-**Note:** Normally a process will open all of the channels, fades and cue it
+**Note:** Normally a process will open all of the channels, fades and cues it
 will use at startup. This will prevent other processes from accessing these
 resources while they are in use.
 

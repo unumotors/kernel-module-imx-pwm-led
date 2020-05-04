@@ -113,10 +113,10 @@
 
 /* clang-format off */
 /** Open object enum */
-enum open_object_type {
-	OPEN_OBJECT_TYPE_NONE,
-	OPEN_OBJECT_TYPE_FADE,
-	OPEN_OBJECT_TYPE_CUE
+enum open_object {
+	OPEN_OBJECT_NONE,
+	OPEN_OBJECT_FADE,
+	OPEN_OBJECT_CUE
 };
 
 /** Fade direction enum */
@@ -154,8 +154,8 @@ struct imx_pwm_led {
 	char *dev_name;
 	/** PID of owner */
 	pid_t owner_pid;
-	/** Type of currently open object */
-	enum open_object_type open_object_type;
+	/** Currently open object */
+	enum open_object open_object;
 	/** Index of currently open object */
 	uint open_object_idx;
 	/** True if writing is ongoing */
@@ -256,14 +256,14 @@ module_param(max_fade_size,    uint, 0);
 module_param(sdma_priority,    uint, 0);
 /* clang-format on */
 
-/** Device global data, shared between all devices */
+/** Module global data, shared between all devices */
 static struct glb_data glb_data;
 
-/** SDMA script compiled from imx_pwm_led_sdma.asm using sdma_asm.pl from
+/** SDMA script compiled from ./imx_pwm_led_sdma.asm using sdma_asm.pl from
  *  http://billauer.co.il/blog/2011/10/imx-sdma-howto-assembler-linux/ */
 static const u32 sdma_script[] = {
 	0x0a000901, 0x69c80400, 0x69c86300, 0x03df7d09, 0x620a4e00,
-	0x7c036a2b, 0x01607df5, 0x6e2b0160, 0x7df20300, 0x01607def,
+	0x7d036a2b, 0x01607df5, 0x6e2b0160, 0x7df20300, 0x01607def,
 };
 
 /*******************************************************************************
@@ -287,6 +287,8 @@ static inline uint get_max_cue_size(void)
 
 static uint get_duty_buf_size(void)
 {
+	/* max_cues + 1 since the last row is used for setting an LED's duty cycle
+	  * by ioctl_set_duty: */
 	return sizeof(u16) * max_leds * (max_cues + 1);
 }
 
@@ -502,8 +504,7 @@ out:
 	return ret;
 }
 
-static int get_cue_led_mask(struct imx_pwm_led *self, uint cue_idx,
-			    uint *led_mask)
+static int check_cue(struct imx_pwm_led *self, uint cue_idx, uint *led_mask)
 {
 	uint i;
 	uint num_items;
@@ -537,13 +538,34 @@ static int get_cue_led_mask(struct imx_pwm_led *self, uint cue_idx,
 				 glb_data.num_leds);
 			return -EFAULT;
 		}
+		/* Prevent an LED being loaded with more than one fade, otherwise the
+		 * fade's player_count would be wrong: */
+		if (*led_mask & (1 << item->led_idx)) {
+			dev_warn(self->dev,
+				 "%s: cue %u: item %u: "
+				 "led_idx %u already specified",
+				 __func__, cue_idx, i, item->led_idx);
+			return -EFAULT;
+		}
+		/* Prevent mutex deadlocks by ensuring own led_idx <= cue item led_idx
+		 * (Since the LEDs in a cue are locked from lowest to highest index,
+		 *  our own LED index must be <= the lowest cue LED index, otherwise you
+		 *  could get into a deadlock situation when playing two cues.) */
+		if (item->led_idx < self->led_idx) {
+			dev_warn(self->dev,
+				 "%s: cue %u: item %u: "
+				 "led_idx %u < own led_idx %u",
+				 __func__, cue_idx, i, item->led_idx,
+				 self->led_idx);
+			return -EFAULT;
+		}
 		*led_mask |= 1 << item->led_idx;
 		item++;
 	}
 	return 0;
 }
 
-static int start_led(struct imx_pwm_led *self)
+static void start_led(struct imx_pwm_led *self)
 {
 	int old_enable;
 	/* Enable the sdma channel */
@@ -554,13 +576,12 @@ static int start_led(struct imx_pwm_led *self)
 	sdma_set_channel_pending(self->sdmac);
 	/* If the channel was already enabled: */
 	if (old_enable) {
-		return 0;
+		return;
 	}
 	dev_dbg(self->dev, "%s", __func__);
-	return 0;
 }
 
-static int start_cue(struct imx_pwm_led *self, uint led_mask)
+static void start_leds(struct imx_pwm_led *self, uint led_mask)
 {
 	uint i;
 	u32 old_sdma_mask, sdma_mask, old_led_mask, started_led_mask;
@@ -584,18 +605,16 @@ static int start_cue(struct imx_pwm_led *self, uint led_mask)
 	started_led_mask = (old_led_mask ^ led_mask) & led_mask;
 	/* If all the channels were already enabled: */
 	if (started_led_mask == 0) {
-		return 0;
+		return;
 	}
 	dev_dbg(self->dev, "%s: 0x%08x, started: 0x%08x", __func__, led_mask,
 		started_led_mask);
-	return 0;
 }
 
 static void dec_fade_player_count(struct imx_pwm_led *self)
 {
 	/* If playing a fade: */
 	if (self->playing_fade_idx >= 0) {
-		/* Decrement the player count: */
 		atomic_dec(
 			&glb_data.fades[self->playing_fade_idx].player_count);
 		barrier();
@@ -661,34 +680,22 @@ static void find_fade_dir(struct imx_pwm_led *self, struct led_fade *fade,
 	while (itr < end) {
 		uint val = *itr;
 		uint last_val = *(itr - 1);
-		if (val > last_val) {
-			if (fade->dir == FADE_DIR_UNKNOWN) {
-				dev_dbg(self->dev, "%s: inc", __func__);
-				fade->dir = FADE_DIR_INCREASING;
-			} else if (fade->dir != FADE_DIR_INCREASING) {
-				dev_dbg(self->dev,
-					"%s: non-monotonic at idx %u", __func__,
-					itr - (const u16 *)fade->buf);
-				fade->dir = FADE_DIR_NON_MONOTONIC;
-				break;
-			} else {
-				/* Still increasing */
-			}
-		} else if (val < last_val) {
-			if (fade->dir == FADE_DIR_UNKNOWN) {
-				dev_dbg(self->dev, "%s: dec", __func__);
-				fade->dir = FADE_DIR_DECREASING;
-			} else if (fade->dir != FADE_DIR_DECREASING) {
-				dev_dbg(self->dev,
-					"%s: non-monotonic at idx %u", __func__,
-					itr - (const u16 *)fade->buf);
-				fade->dir = FADE_DIR_NON_MONOTONIC;
-				break;
-			} else {
-				/* Still decreasing */
-			}
+		if (val == last_val) {
+			/* Same value */
+		} else if (fade->dir == FADE_DIR_UNKNOWN) {
+			dev_dbg(self->dev, "%s: %s", __func__,
+				(val > last_val) ? "inc" : "dec");
+			fade->dir = (val > last_val) ? FADE_DIR_INCREASING :
+						       FADE_DIR_DECREASING;
+		} else if (fade->dir != (val > last_val) ?
+				   FADE_DIR_INCREASING :
+				   FADE_DIR_DECREASING) {
+			dev_dbg(self->dev, "%s: non-monotonic at idx %u",
+				__func__, itr - (const u16 *)fade->buf);
+			fade->dir = FADE_DIR_NON_MONOTONIC;
+			break;
 		} else {
-			/* Same */
+			/* Same direction */
 		}
 		itr++;
 	}
@@ -866,13 +873,6 @@ static int load_sdma_fade(struct imx_pwm_led *self, uint fade_idx)
 		goto out;
 	}
 
-	/* Set the playing fade index and increment the fade's player_count.
-	 * This will prevent any thread from writing to it while it is being
-	 * played. The player_count is decremented when the LED is stopped. */
-	self->playing_fade_idx = fade_idx;
-	atomic_inc(&fade->player_count);
-	barrier();
-
 	/* If the adaptive behaviour is enabled (starting a new fade while an
 	 * existing one is playing results in the new fade starting from the
 	 * nearest duty cycle to the current one): */
@@ -900,34 +900,28 @@ static int load_sdma_fade(struct imx_pwm_led *self, uint fade_idx)
 	if (ret) {
 		dev_err(self->dev, "%s: failed to load context", __func__);
 	}
+
+	/* Set the playing fade index and increment the fade's player_count.
+	 * This will prevent any thread from writing to it while it is being
+	 * played. The player_count is decremented when the LED is stopped. */
+	self->playing_fade_idx = fade_idx;
+	atomic_inc(&fade->player_count);
+	barrier();
 out:
 	mutex_unlock(&fade->lock);
 	return ret;
 }
 
+/** Note: This function must only be called after calling check_cue, which
+ *  validates the cue_idx, cue length and the LED indexes of the cue items. */
 static int load_sdma_cue(struct imx_pwm_led *self, uint cue_idx)
 {
 	int ret;
 	uint i;
 	uint num_items;
-	const struct led_cue* cue;
+	const struct led_cue *cue = &glb_data.cues[cue_idx];
+	uint loaded_fade_led_mask = 0;
 	dev_dbg(self->dev, "%s: %u", __func__, cue_idx);
-
-	if (cue_idx >= max_cues) {
-		dev_warn(self->dev, "%s: %u >= max_cues %u", __func__, cue_idx,
-			 max_cues);
-		return -EINVAL;
-	}
-	cue = &glb_data.cues[cue_idx];
-	if (cue->len == 0) {
-		dev_warn(self->dev, "%s: cue %u: len == 0", __func__, cue_idx);
-		return -ENODATA;
-	}
-	if ((cue->len % sizeof(struct led_cue_item)) != 0) {
-		dev_warn(self->dev, "%s: cue %u: len %u %% %u != 0", __func__,
-			 cue_idx, cue->len, sizeof(struct led_cue_item));
-		return -EFAULT;
-	}
 
 	/* Load all of the items listed in the cue: */
 	num_items = cue->len / sizeof(struct led_cue_item);
@@ -935,43 +929,38 @@ static int load_sdma_cue(struct imx_pwm_led *self, uint cue_idx)
 		const struct led_cue_item *item = &cue->items[i];
 		uint led_idx = item->led_idx;
 		uint type = item->type & 0x0F;
-		struct imx_pwm_led *led;
-		if (led_idx >= glb_data.num_leds) {
-			dev_warn(self->dev,
-				 "%s: cue %u: item %u: "
-				 "led_idx %u >= num_leds %u",
-				 __func__, cue_idx, i, led_idx,
-				 glb_data.num_leds);
-			return -EFAULT;
-		}
-		led = glb_data.leds[led_idx];
-		if (am_not_owner(led->owner_pid)) {
-			dev_warn(self->dev, "%s: led %u is owned by pid %d",
-				 __func__, led_idx, led->owner_pid);
-			return -EPERM;
-		}
+		struct imx_pwm_led *led = glb_data.leds[led_idx];
 		switch (type) {
-		case PWM_LED_CUE_ITEM_TYPE_DUTY: {
+		case PWM_LED_CUE_ITEM_TYPE_DUTY:
 			if ((ret = load_sdma_duty(led, cue_idx, led_idx,
 						  item->val))) {
-				return ret;
+				goto fail;
 			}
 			break;
-		}
 		case PWM_LED_CUE_ITEM_TYPE_FADE:
 			if ((ret = load_sdma_fade(led, item->val))) {
-				return ret;
+				goto fail;
 			}
+			loaded_fade_led_mask |= 1 << led_idx;
 			break;
 		default:
 			dev_warn(self->dev,
 				 "%s: cue %u: item %u: unknown type %u",
 				 __func__, cue_idx, i, type);
-			return -EINVAL;
+			ret = -EINVAL;
+			goto fail;
 		}
 		item++;
 	}
 	return 0;
+fail:
+	/* On failure, revert the fade player counts: */
+	for (i = 0; i < glb_data.num_leds; i++) {
+		if (loaded_fade_led_mask & (1 << i)) {
+			dec_fade_player_count(glb_data.leds[i]);
+		}
+	}
+	return ret;
 }
 
 static int set_sdma_active(struct imx_pwm_led *self, int active)
@@ -1160,14 +1149,14 @@ static ssize_t imx_pwm_led_dev_write(struct file *filp, const char __user *data,
 {
 	ssize_t nbytes;
 	DEV_SELF_FROM_FILP(filp);
-	switch (self->open_object_type) {
-	case OPEN_OBJECT_TYPE_CUE:
+	switch (self->open_object) {
+	case OPEN_OBJECT_CUE:
 		nbytes = write_cue(self, data, count);
 		break;
-	case OPEN_OBJECT_TYPE_FADE:
+	case OPEN_OBJECT_FADE:
 		nbytes = write_fade(self, data, count);
 		break;
-	case OPEN_OBJECT_TYPE_NONE:
+	case OPEN_OBJECT_NONE:
 	default:
 		dev_warn(dev, "write: no open object");
 		return -EPERM;
@@ -1188,8 +1177,8 @@ static loff_t imx_pwm_led_dev_llseek(struct file *filp, loff_t off, int whence)
 	if (off != 0 || whence != SEEK_SET) {
 		return -EINVAL;
 	}
-	switch (self->open_object_type) {
-	case OPEN_OBJECT_TYPE_CUE: {
+	switch (self->open_object) {
+	case OPEN_OBJECT_CUE: {
 		int ret;
 		struct led_cue *cue;
 		if ((ret = open_cue(self, self->open_object_idx))) {
@@ -1202,7 +1191,7 @@ static loff_t imx_pwm_led_dev_llseek(struct file *filp, loff_t off, int whence)
 		mutex_unlock(&cue->lock);
 		break;
 	}
-	case OPEN_OBJECT_TYPE_FADE: {
+	case OPEN_OBJECT_FADE: {
 		int ret;
 		struct led_fade *fade;
 		if ((ret = open_fade(self, self->open_object_idx))) {
@@ -1215,7 +1204,7 @@ static loff_t imx_pwm_led_dev_llseek(struct file *filp, loff_t off, int whence)
 		mutex_unlock(&fade->lock);
 		break;
 	}
-	case OPEN_OBJECT_TYPE_NONE:
+	case OPEN_OBJECT_NONE:
 	default:
 		dev_warn(self->dev, "seek: no open object");
 		return -EPERM;
@@ -1231,7 +1220,7 @@ static long ioctl_open_fade(struct imx_pwm_led *self, unsigned long arg)
 	if ((ret = open_fade(self, arg))) {
 		return ret;
 	}
-	self->open_object_type = OPEN_OBJECT_TYPE_FADE;
+	self->open_object = OPEN_OBJECT_FADE;
 	self->open_object_idx = arg;
 	return 0;
 }
@@ -1243,7 +1232,7 @@ static long ioctl_open_cue(struct imx_pwm_led *self, unsigned long arg)
 	if ((ret = open_cue(self, arg))) {
 		return ret;
 	}
-	self->open_object_type = OPEN_OBJECT_TYPE_CUE;
+	self->open_object = OPEN_OBJECT_CUE;
 	self->open_object_idx = arg;
 	return 0;
 }
@@ -1255,7 +1244,7 @@ static long ioctl_close_fade(struct imx_pwm_led *self, unsigned long arg)
 	if ((ret = close_fade(self, arg))) {
 		return ret;
 	}
-	self->open_object_type = OPEN_OBJECT_TYPE_NONE;
+	self->open_object = OPEN_OBJECT_NONE;
 	return 0;
 }
 
@@ -1266,7 +1255,7 @@ static long ioctl_close_cue(struct imx_pwm_led *self, unsigned long arg)
 	if ((ret = close_cue(self, arg))) {
 		return ret;
 	}
-	self->open_object_type = OPEN_OBJECT_TYPE_NONE;
+	self->open_object = OPEN_OBJECT_NONE;
 	return 0;
 }
 
@@ -1320,6 +1309,7 @@ static long ioctl_set_duty(struct imx_pwm_led *self, unsigned long arg)
 	if ((ret = load_sdma_duty(self, max_cues, self->led_idx, arg))) {
 		return ret;
 	}
+	start_led(self);
 	return 0;
 }
 
@@ -1360,7 +1350,8 @@ static long ioctl_set_active(struct imx_pwm_led *self, unsigned long arg)
 		return 0;
 	}
 
-	/* Fetch the current duty: */
+	/* The LED is not currently playing, so we'll set the duty manually.
+	 * Firstly, fetch the current duty: */
 	if ((ret = fetch_sdma_duty(self, &duty))) {
 		return ret;
 	}
@@ -1389,9 +1380,7 @@ static long ioctl_play_fade(struct imx_pwm_led *self, unsigned long arg)
 		return ret;
 	}
 	/* 3. Start our LED (it will be unlocked later) */
-	if ((ret = start_led(self))) {
-		return ret;
-	}
+	start_led(self);
 	return 0;
 }
 
@@ -1407,8 +1396,8 @@ static long ioctl_play_cue(struct imx_pwm_led *self, unsigned long arg)
 	}
 	cue = &glb_data.cues[arg];
 	mutex_lock(&cue->lock);
-	/* 2. Get the LEDs in the cue */
-	if ((ret = get_cue_led_mask(self, arg, &led_mask))) {
+	/* 2. Check the cue, getting the LED mask */
+	if ((ret = check_cue(self, arg, &led_mask))) {
 		goto out_cue;
 	}
 	/* 3. Lock the LEDs except our own, which was already locked */
@@ -1422,7 +1411,7 @@ static long ioctl_play_cue(struct imx_pwm_led *self, unsigned long arg)
 		goto out_led;
 	}
 	/* 6. Start the LEDs */
-	ret = start_cue(self, led_mask);
+	start_leds(self, led_mask);
 out_led:
 	/* 7. Unlock the LEDs except our own, which will be unlocked later */
 	unlock_leds(led_mask & ~(1 << self->led_idx));
@@ -1450,22 +1439,24 @@ static long ioctl_stop_cue(struct imx_pwm_led *self, unsigned long arg)
 	uint led_mask;
 	struct led_cue *cue;
 	dev_dbg(self->dev, "ioctl: STOP_CUE: %lu", arg);
+	/* 1. Firstly open and lock the cue */
 	if ((ret = open_cue(self, arg))) {
 		return ret;
 	}
 	cue = &glb_data.cues[arg];
 	mutex_lock(&cue->lock);
-	/* 1. Get the LEDs in the cue */
-	if ((ret = get_cue_led_mask(self, arg, &led_mask))) {
+	/* 2. Check the cue, getting the LED mask */
+	if ((ret = check_cue(self, arg, &led_mask))) {
 		goto out;
 	}
-	/* 2. Lock the LEDs except our own, which was already locked */
+	/* 3. Lock the LEDs except our own, which was already locked */
 	lock_leds(led_mask & ~(1 << self->led_idx));
-	/* 3. Stop the LEDs */
+	/* 4. Stop the LEDs */
 	ret = stop_leds(self, led_mask);
-	/* 4. Unlock the LEDs except our own, which will be unlocked later */
+	/* 5. Unlock the LEDs except our own, which will be unlocked later */
 	unlock_leds(led_mask & ~(1 << self->led_idx));
 out:
+	/* 6. Finally unlock the cue */
 	mutex_unlock(&cue->lock);
 	return ret;
 }
