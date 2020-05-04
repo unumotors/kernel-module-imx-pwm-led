@@ -1,33 +1,38 @@
 # Freescale i.MX PWM LED Linux Kernel Module
-Copyright (C) 2020 unu GmbH
-
-Written by [Geoffrey Phillips](http://geoff.phillips.fm).
-
-## License
-```
-This library is free software; you can redistribute it and/or modify
-it under the terms of the GNU General Public License version 2 as
-published by the Free Software Foundation.
-
-This library is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-GNU General Public License for more details.
-
-You should have received a copy of the GNU General Public License
-along with this library.  If not, see <http://www.gnu.org/licenses/>.
-```
-
-## Overview
-This Linux kernel module controls multiple PWM channels using the SDMA for
-driving LEDs on Freescale (NXP) [i.MX](https://www.nxp.com/products/processors-and-microcontrollers/arm-processors/i-mx-applications-processors)
+This Linux loadable kernel module controls multiple PWM channels for driving
+LEDs using the SDMA on Freescale (NXP) [i.MX](https://www.nxp.com/products/processors-and-microcontrollers/arm-processors/i-mx-applications-processors)
 processors.
+
+The module supports pre-loading of 'fades' (a buffer of PWM duty-cycle samples)
+and 'cues' (a list of actions to perform on one or more PWM channels), that can
+then be triggered quickly later using `ioctl`.
 
 Much of this code is adapted from the [imx-pwm-audio](https://github.com/Glowforge/kernel-module-imx-pwm-audio/)
 module from Glowforge and the [meta-openglow](https://github.com/ScottW514/meta-openglow)
-kernel patches from OpenGlow.
-The [i.MX SDMA assembler](http://billauer.co.il/blog/2011/10/imx-sdma-howto-assembler-linux/)
+kernel patches from OpenGlow. The [i.MX SDMA assembler](http://billauer.co.il/blog/2011/10/imx-sdma-howto-assembler-linux/)
 from Eli Billauer was also used.
+
+## Quick-Start Guide
+Using [ioctl](https://github.com/jerome-pouiller/ioctl/):
+```
+# Load the module with parameters:
+insmod imx_pwm_led.ko pwm_period=48000 pwm_invert=0
+
+# Open fade0:
+ioctl /dev/pwm_led0 0x00007541 -v 0
+
+# Write a fade file:
+cat my_fade.bin > /dev/pwm_led0
+
+# Open cue0:
+ioctl /dev/pwm_led0 0x00007542 -v 0
+
+# Write 2 cue actions to play fade0 on channels 0 and 1:
+printf "\x00\x00\x00\x00\x01\x00\x00\x00" > /dev/pwm_led0
+
+# Play cue0:
+ioctl /dev/pwm_led0 0x00007546 -v 0
+```
 
 ## Requirements
 The module requires kernel patches to expose driver APIs to the i.MX EPIT and
@@ -59,17 +64,17 @@ The module creates devices for each PWM channel visible at `/dev/pwm_led0` to
     **Note:** A cue may start the same fade on multiple channels at the same
     time.
 
-    The format of each item in the cue list is as follows (as defined in
+    The format of each action in the cue is as follows (as defined in
     `pwm_led.h`):
 
-        #define PWM_LED_CUE_ITEM_BIT_LED   0
-        #define PWM_LED_CUE_ITEM_BIT_TYPE  8
-        #define PWM_LED_CUE_ITEM_BIT_VAL   16
-        #define PWM_LED_CUE_ITEM_MASK_LED  0x0000001F
-        #define PWM_LED_CUE_ITEM_MASK_TYPE 0x00000F00 /* See below */
-        #define PWM_LED_CUE_ITEM_MASK_VAL  0xFFFF0000
-        #define PWM_LED_CUE_ITEM_TYPE_FADE 0 /* Value=fade index */
-        #define PWM_LED_CUE_ITEM_TYPE_DUTY 1 /* Value=duty cycle */
+        #define PWM_LED_CUE_ACTION_BIT_LED   0
+        #define PWM_LED_CUE_ACTION_BIT_TYPE  8
+        #define PWM_LED_CUE_ACTION_BIT_VAL   16
+        #define PWM_LED_CUE_ACTION_MASK_LED  0x0000001F
+        #define PWM_LED_CUE_ACTION_MASK_TYPE 0x00000F00 /* See below */
+        #define PWM_LED_CUE_ACTION_MASK_VAL  0xFFFF0000
+        #define PWM_LED_CUE_ACTION_TYPE_FADE 0 /* Value=fade index */
+        #define PWM_LED_CUE_ACTION_TYPE_DUTY 1 /* Value=duty cycle */
 
   - For each channel the module has the following modes:
     - 'Adaptive': This is a configuration option. It causes the channel to
@@ -207,26 +212,4 @@ do_install_append() {
     install -d ${D}${includedir}/linux
     install -m 0644 ${S}/pwm_led.h ${D}${includedir}/linux
 }
-```
-
-## Quick-Start Guide
-Using [ioctl](https://github.com/jerome-pouiller/ioctl/):
-```
-# Load the module with parameters:
-insmod imx_pwm_led.ko pwm_period=48000 pwm_invert=1
-
-# Open fade0:
-ioctl /dev/pwm_led0 0x00007541 -v 0
-
-# Write a fade file:
-cat my_fade.bin > /dev/pwm_led0
-
-# Open cue0:
-ioctl /dev/pwm_led0 0x00007542 -v 0
-
-# Write 2 cue items to play fade0 on channels 0 and 1:
-printf "\x00\x00\x00\x00\x01\x00\x00\x00" > /dev/pwm_led0
-
-# Play cue0:
-ioctl /dev/pwm_led0 0x00007546 -v 0
 ```

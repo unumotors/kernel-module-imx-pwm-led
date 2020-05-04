@@ -184,11 +184,11 @@ struct led_fade {
 	atomic_t player_count;
 };
 
-/** Cue item struct */
-struct led_cue_item {
+/** Cue action struct */
+struct led_cue_action {
 	/** Index of LED */
 	u8 led_idx;
-	/** Type, see PWM_LED_CUE_ITEM_TYPE_* */
+	/** Type, see PWM_LED_CUE_ACTION_TYPE_* */
 	u8 type;
 	/** Value */
 	u16 val;
@@ -196,9 +196,9 @@ struct led_cue_item {
 
 /** Cue struct */
 struct led_cue {
-	/** Buffer of cue items */
-	struct led_cue_item *items;
-	/** Length of item data in **bytes** */
+	/** Buffer of actions */
+	struct led_cue_action *actions;
+	/** Length of action data in **bytes** */
 	uint len;
 	/** Lock to guard access */
 	struct mutex lock;
@@ -282,13 +282,13 @@ static inline int am_not_owner(pid_t owner_pid)
 
 static inline uint get_max_cue_size(void)
 {
-	return max_leds * sizeof(struct led_cue_item);
+	return max_leds * sizeof(struct led_cue_action);
 }
 
 static uint get_duty_buf_size(void)
 {
-	/* max_cues + 1 since the last row is used for setting an LED's duty cycle
-	  * by ioctl_set_duty: */
+	/* max_cues + 1 since the last row is used for setting an LED's duty
+	 * cycle by ioctl_set_duty: */
 	return sizeof(u16) * max_leds * (max_cues + 1);
 }
 
@@ -507,7 +507,7 @@ out:
 static int check_cue(struct imx_pwm_led *self, uint cue_idx, uint *led_mask)
 {
 	uint i;
-	uint num_items;
+	uint num_actions;
 	const struct led_cue *cue;
 
 	if (cue_idx >= max_cues) {
@@ -520,47 +520,49 @@ static int check_cue(struct imx_pwm_led *self, uint cue_idx, uint *led_mask)
 		dev_warn(self->dev, "%s: cue %u: len == 0", __func__, cue_idx);
 		return -ENODATA;
 	}
-	if ((cue->len % sizeof(struct led_cue_item)) != 0) {
+	if ((cue->len % sizeof(struct led_cue_action)) != 0) {
 		dev_warn(self->dev, "%s: cue %u: len %u %% %u != 0", __func__,
-			 cue_idx, cue->len, sizeof(struct led_cue_item));
+			 cue_idx, cue->len, sizeof(struct led_cue_action));
 		return -EFAULT;
 	}
 
 	*led_mask = 0;
-	num_items = cue->len / sizeof(struct led_cue_item);
-	for (i = 0; i < num_items; i++) {
-		const struct led_cue_item *item = &cue->items[i];
-		if (item->led_idx >= glb_data.num_leds) {
+	num_actions = cue->len / sizeof(struct led_cue_action);
+	for (i = 0; i < num_actions; i++) {
+		const struct led_cue_action *action = &cue->actions[i];
+		if (action->led_idx >= glb_data.num_leds) {
 			dev_warn(self->dev,
-				 "%s: cue %u: item %u: "
+				 "%s: cue %u: action %u: "
 				 "led_idx %u >= num_leds %u",
-				 __func__, cue_idx, i, item->led_idx,
+				 __func__, cue_idx, i, action->led_idx,
 				 glb_data.num_leds);
 			return -EFAULT;
 		}
-		/* Prevent an LED being loaded with more than one fade, otherwise the
-		 * fade's player_count would be wrong: */
-		if (*led_mask & (1 << item->led_idx)) {
+		/* Prevent an LED being loaded with more than one fade,
+		 * otherwise the fade's player_count would be wrong: */
+		if (*led_mask & (1 << action->led_idx)) {
 			dev_warn(self->dev,
-				 "%s: cue %u: item %u: "
+				 "%s: cue %u: action %u: "
 				 "led_idx %u already specified",
-				 __func__, cue_idx, i, item->led_idx);
+				 __func__, cue_idx, i, action->led_idx);
 			return -EFAULT;
 		}
-		/* Prevent mutex deadlocks by ensuring own led_idx <= cue item led_idx
-		 * (Since the LEDs in a cue are locked from lowest to highest index,
-		 *  our own LED index must be <= the lowest cue LED index, otherwise you
-		 *  could get into a deadlock situation when playing two cues.) */
-		if (item->led_idx < self->led_idx) {
+		/* Prevent mutex deadlocks by ensuring own led_idx <= cue action
+		 * led_idx
+		 * (Since the LEDs in a cue are locked from lowest to highest
+		 *  index, our own LED index must be <= the lowest cue LED
+		 *  index, otherwise you could get into a deadlock situation
+		 *  when playing two cues.) */
+		if (action->led_idx < self->led_idx) {
 			dev_warn(self->dev,
-				 "%s: cue %u: item %u: "
+				 "%s: cue %u: action %u: "
 				 "led_idx %u < own led_idx %u",
-				 __func__, cue_idx, i, item->led_idx,
+				 __func__, cue_idx, i, action->led_idx,
 				 self->led_idx);
 			return -EFAULT;
 		}
-		*led_mask |= 1 << item->led_idx;
-		item++;
+		*led_mask |= 1 << action->led_idx;
+		action++;
 	}
 	return 0;
 }
@@ -913,44 +915,44 @@ out:
 }
 
 /** Note: This function must only be called after calling check_cue, which
- *  validates the cue_idx, cue length and the LED indexes of the cue items. */
+ *  validates the cue_idx, cue length and the LED indexes of the cue actions. */
 static int load_sdma_cue(struct imx_pwm_led *self, uint cue_idx)
 {
 	int ret;
 	uint i;
-	uint num_items;
+	uint num_actions;
 	const struct led_cue *cue = &glb_data.cues[cue_idx];
 	uint loaded_fade_led_mask = 0;
 	dev_dbg(self->dev, "%s: %u", __func__, cue_idx);
 
-	/* Load all of the items listed in the cue: */
-	num_items = cue->len / sizeof(struct led_cue_item);
-	for (i = 0; i < num_items; i++) {
-		const struct led_cue_item *item = &cue->items[i];
-		uint led_idx = item->led_idx;
-		uint type = item->type & 0x0F;
+	/* Load all of the actions listed in the cue: */
+	num_actions = cue->len / sizeof(struct led_cue_action);
+	for (i = 0; i < num_actions; i++) {
+		const struct led_cue_action *action = &cue->actions[i];
+		uint led_idx = action->led_idx;
+		uint type = action->type & 0x0F;
 		struct imx_pwm_led *led = glb_data.leds[led_idx];
 		switch (type) {
-		case PWM_LED_CUE_ITEM_TYPE_DUTY:
+		case PWM_LED_CUE_ACTION_TYPE_DUTY:
 			if ((ret = load_sdma_duty(led, cue_idx, led_idx,
-						  item->val))) {
+						  action->val))) {
 				goto fail;
 			}
 			break;
-		case PWM_LED_CUE_ITEM_TYPE_FADE:
-			if ((ret = load_sdma_fade(led, item->val))) {
+		case PWM_LED_CUE_ACTION_TYPE_FADE:
+			if ((ret = load_sdma_fade(led, action->val))) {
 				goto fail;
 			}
 			loaded_fade_led_mask |= 1 << led_idx;
 			break;
 		default:
 			dev_warn(self->dev,
-				 "%s: cue %u: item %u: unknown type %u",
+				 "%s: cue %u: action %u: unknown type %u",
 				 __func__, cue_idx, i, type);
 			ret = -EINVAL;
 			goto fail;
 		}
-		item++;
+		action++;
 	}
 	return 0;
 fail:
@@ -1087,7 +1089,7 @@ static ssize_t write_cue(struct imx_pwm_led *self, const char __user *data,
 	}
 	bytes_free = get_max_cue_size() - cue->len;
 	nbytes = min(count, bytes_free);
-	if (copy_from_user(((void *)cue->items) + cue->len, data, nbytes)) {
+	if (copy_from_user(((void *)cue->actions) + cue->len, data, nbytes)) {
 		dev_err(self->dev, "write: failed userspace copy");
 		nbytes = -EFAULT;
 		goto out;
@@ -1559,12 +1561,12 @@ static int probe_first_dev(struct platform_device *pdev)
 		mutex_init(&glb_data.cues[i].lock);
 	}
 	for (i = 0; i < max_cues; i++) {
-		glb_data.cues[i].items =
+		glb_data.cues[i].actions =
 			kzalloc(get_max_cue_size(), GFP_KERNEL);
-		if (glb_data.cues[i].items == NULL) {
+		if (glb_data.cues[i].actions == NULL) {
 			dev_err(&pdev->dev, "probe: failed to allocate memory");
 			ret = -ENOMEM;
-			goto failed_cue_items_alloc;
+			goto failed_cue_actions_alloc;
 		}
 	}
 	glb_data.duty_buf = dma_zalloc_coherent(&pdev->dev, get_duty_buf_size(),
@@ -1654,10 +1656,10 @@ failed_fade_alloc:
 					  fade->buf_phys);
 		}
 	}
-failed_cue_items_alloc:
+failed_cue_actions_alloc:
 	for (i = 0; i < max_cues; i++) {
 		mutex_destroy(&glb_data.cues[i].lock);
-		kfree(glb_data.cues[i].items);
+		kfree(glb_data.cues[i].actions);
 	}
 	kfree(glb_data.cues);
 failed_alloc_cues:
@@ -1683,7 +1685,7 @@ static void remove_first_dev(struct platform_device *pdev)
 	}
 	for (i = 0; i < max_cues; i++) {
 		mutex_destroy(&glb_data.cues[i].lock);
-		kfree(glb_data.cues[i].items);
+		kfree(glb_data.cues[i].actions);
 	}
 	kfree(glb_data.cues);
 	for (i = 0; i < max_fades; i++) {
