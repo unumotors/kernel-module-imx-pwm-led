@@ -689,9 +689,9 @@ static void find_fade_dir(struct imx_pwm_led *self, struct led_fade *fade,
 				(val > last_val) ? "inc" : "dec");
 			fade->dir = (val > last_val) ? FADE_DIR_INCREASING :
 						       FADE_DIR_DECREASING;
-		} else if (fade->dir != (val > last_val) ?
-				   FADE_DIR_INCREASING :
-				   FADE_DIR_DECREASING) {
+		} else if ((fade->dir == FADE_DIR_INCREASING)
+			   ? (val < last_val)
+			   : (val > last_val)) {
 			dev_dbg(self->dev, "%s: non-monotonic at idx %u",
 				__func__, itr - (const u16 *)fade->buf);
 			fade->dir = FADE_DIR_NON_MONOTONIC;
