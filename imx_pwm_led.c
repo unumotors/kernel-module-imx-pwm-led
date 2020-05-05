@@ -126,6 +126,13 @@ enum fade_dir {
 	FADE_DIR_DECREASING,
 	FADE_DIR_NON_MONOTONIC
 };
+
+/** Permission mode enum */
+enum perm_mode {
+	PERM_MODE_NO_OWNER,
+	PERM_MODE_PID_OWNER,
+	PERM_MODE_NUM
+};
 /* clang-format on */
 
 /** LED device data struct */
@@ -244,6 +251,7 @@ static u32 max_cues         = 16;
 static u32 max_leds         = 8; /* imx6ul has 8 PWMs */
 static u32 max_fade_size    = 4096; /* DMA memory block size is 4KB */
 static u32 sdma_priority    = 5; /* Allowed range: 1 to 6 */
+static u32 perm_mode        = PERM_MODE_PID_OWNER; /* Permission mode */
 module_param(sample_rate,      uint, 0);
 module_param(pwm_period,       uint, 0);
 module_param(pwm_prescaler,    uint, 0);
@@ -254,6 +262,7 @@ module_param(max_cues,         uint, 0);
 module_param(max_leds,         uint, 0);
 module_param(max_fade_size,    uint, 0);
 module_param(sdma_priority,    uint, 0);
+module_param(perm_mode,        uint, 0);
 /* clang-format on */
 
 /** Module global data, shared between all devices */
@@ -429,7 +438,9 @@ static int open_fade(struct imx_pwm_led *self, uint fade_idx)
 		ret = -EPERM;
 		goto out;
 	}
-	fade->owner_pid = get_my_pid();
+	if (perm_mode == PERM_MODE_PID_OWNER) {
+		fade->owner_pid = get_my_pid();
+	}
 out:
 	mutex_unlock(&fade->lock);
 	return ret;
@@ -452,7 +463,9 @@ static int open_cue(struct imx_pwm_led *self, uint cue_idx)
 		ret = -EPERM;
 		goto out;
 	}
-	cue->owner_pid = get_my_pid();
+	if (perm_mode == PERM_MODE_PID_OWNER) {
+		cue->owner_pid = get_my_pid();
+	}
 out:
 	mutex_unlock(&cue->lock);
 	return ret;
@@ -689,9 +702,9 @@ static void find_fade_dir(struct imx_pwm_led *self, struct led_fade *fade,
 				(val > last_val) ? "inc" : "dec");
 			fade->dir = (val > last_val) ? FADE_DIR_INCREASING :
 						       FADE_DIR_DECREASING;
-		} else if ((fade->dir == FADE_DIR_INCREASING)
-			   ? (val < last_val)
-			   : (val > last_val)) {
+		} else if ((fade->dir == FADE_DIR_INCREASING) ?
+				   (val < last_val) :
+				   (val > last_val)) {
 			dev_dbg(self->dev, "%s: non-monotonic at idx %u",
 				__func__, itr - (const u16 *)fade->buf);
 			fade->dir = FADE_DIR_NON_MONOTONIC;
@@ -1030,7 +1043,9 @@ static int imx_pwm_led_dev_open(struct inode *inode, struct file *filp)
 		goto out;
 	}
 	dev_dbg(dev, "open: " DEVICE_PATH "%s by pid %d", self->dev_name, pid);
-	self->owner_pid = pid;
+	if (perm_mode == PERM_MODE_PID_OWNER) {
+		self->owner_pid = pid;
+	}
 	self->writing = 0;
 out:
 	mutex_unlock(&self->lock);
@@ -1914,6 +1929,11 @@ static int __init imx_pwm_led_init(void)
 	if ((sdma_priority == 0) || (sdma_priority > 6)) {
 		pr_err("%s: value %u is invalid for sdma_priority param\n",
 		       THIS_MODULE->name, sdma_priority);
+		return -EINVAL;
+	}
+	if (perm_mode >= PERM_MODE_NUM) {
+		pr_err("%s: value %u is invalid for perm_mode param\n",
+		       THIS_MODULE->name, perm_mode);
 		return -EINVAL;
 	}
 

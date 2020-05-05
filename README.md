@@ -114,6 +114,7 @@ The module has the following parameters (applicable to all channels):
     max_leds         - Maximum number of LEDs (PWM channels)
     max_fade_size    - Maximum fade size in bytes
     sdma_priority    - SDMA priority, allowed range 1 to 6
+    perm_mode        - Permission mode
 
 ### ioctl Commands
 The devices support the following `ioctl` commands defined in `pwm_led.h`:
