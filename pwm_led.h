@@ -46,9 +46,11 @@
 #define PWM_LED_CFG_BIT_PERIOD     0
 #define PWM_LED_CFG_BIT_PRESCALER  16
 #define PWM_LED_CFG_BIT_INVERT     28
+#define PWM_LED_CFG_BIT_REPEAT     29
 #define PWM_LED_CFG_MASK_PERIOD    0x0000FFFF /* Range 2 to 65535 */
 #define PWM_LED_CFG_MASK_PRESCALER 0x0FFF0000 /* N-1 value, range 0 to 4095 */
 #define PWM_LED_CFG_MASK_INVERT    0x10000000
+#define PWM_LED_CFG_MASK_REPEAT    0x60000000 /* 2^N value, range 0 to 3 */
 
 /** After a cue is opened using PWM_LED_OPEN_CUE, u32 'cue actions' shall be
  *  written to the device in the following format. */

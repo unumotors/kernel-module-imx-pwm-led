@@ -60,6 +60,7 @@
 #define DEFAULT_ACTIVE        1 /* Default 'active' value: true */
 #define DEFAULT_ADAPTIVE      0 /* Default 'adaptive' value: false */
 #define MAX_PWM_PRESCALER     4095
+#define MAX_PWM_REPEAT        3
 
 /** PWM Control Register */
 #define PWMCR                 0x00
@@ -83,10 +84,7 @@
 #define PWMCR_CLKSRC_IPG      (1 << 16)
 #define PWMCR_PRESCALER(x)    (((x) & 0xFFF) << 4)
 #define PWMCR_SWR             (1 << 3)
-#define PWMCR_REPEAT_1        (0 << 1)
-#define PWMCR_REPEAT_2        (1 << 1)
-#define PWMCR_REPEAT_4        (2 << 1)
-#define PWMCR_REPEAT_8        (3 << 1)
+#define PWMCR_REPEAT(x)       (((x) & 0x3) << 1)
 #define PWMCR_EN              (1 << 0)
 
 #define PWMSR_FWE             (1 << 6)
@@ -246,6 +244,7 @@ static u32 pwm_period       = 24000; /* 24 MHz IPG clk / 24000 = 1 kHz */
 static u32 pwm_prescaler    = 0; /* N-1 value, allowed range: 0 to 4095 */
 static u32 pwm_invert       = 0; /* 0=non-inverted, 1=inverted */
 static u32 pwm_phase_offset = 0; /* PWM channel phase offset in microseconds */
+static u32 pwm_repeat       = 0; /* 2^N value, allowed range: 0 to 3  */
 static u32 max_fades        = 16;
 static u32 max_cues         = 16;
 static u32 max_leds         = 8; /* imx6ul has 8 PWMs */
@@ -257,6 +256,7 @@ module_param(pwm_period,       uint, 0);
 module_param(pwm_prescaler,    uint, 0);
 module_param(pwm_invert,       uint, 0);
 module_param(pwm_phase_offset, uint, 0);
+module_param(pwm_repeat,       uint, 0);
 module_param(max_fades,        uint, 0);
 module_param(max_cues,         uint, 0);
 module_param(max_leds,         uint, 0);
@@ -350,7 +350,7 @@ static u32 convert_mask_sdma_to_led(uint sdma_mask)
  ******************************************************************************/
 
 static int config_pwm(struct imx_pwm_led *self, u32 period, u32 prescaler,
-		      u32 invert)
+		      u32 invert, u32 repeat)
 {
 	u32 cr;
 	uint clk;
@@ -367,7 +367,7 @@ static int config_pwm(struct imx_pwm_led *self, u32 period, u32 prescaler,
 		return ret;
 	}
 
-	cr = PWMCR_REPEAT_1 | PWMCR_DOZEEN | PWMCR_WAITEN | PWMCR_DBGEN |
+	cr = PWMCR_REPEAT(repeat) | PWMCR_DOZEEN | PWMCR_WAITEN | PWMCR_DBGEN |
 	     PWMCR_CLKSRC_IPG_HIGH | PWMCR_PRESCALER(prescaler) |
 	     PWMCR_POUTC(invert);
 
@@ -1283,6 +1283,7 @@ static long ioctl_configure(struct imx_pwm_led *self, unsigned long arg)
 	uint prescaler = (arg & PWM_LED_CFG_MASK_PRESCALER) >>
 			 PWM_LED_CFG_BIT_PRESCALER;
 	uint invert = (arg & PWM_LED_CFG_MASK_INVERT) >> PWM_LED_CFG_BIT_INVERT;
+	uint repeat = (arg & PWM_LED_CFG_MASK_REPEAT) >> PWM_LED_CFG_BIT_REPEAT;
 	dev_dbg(self->dev,
 		"ioctl: CONFIGURE: period: %u, prescaler: %u, invert: %u",
 		period, prescaler, invert);
@@ -1296,12 +1297,17 @@ static long ioctl_configure(struct imx_pwm_led *self, unsigned long arg)
 			 prescaler);
 		return -EINVAL;
 	}
+	if (repeat > MAX_PWM_REPEAT) {
+		dev_warn(self->dev, "ioctl: CONFIGURE: invalid repeat %u",
+			 repeat);
+		return -EINVAL;
+	}
 
 	if ((ret = stop_led(self))) {
 		return ret;
 	}
 	disable_pwm(self);
-	if ((ret = config_pwm(self, period, prescaler, invert))) {
+	if ((ret = config_pwm(self, period, prescaler, invert, repeat))) {
 		return ret;
 	}
 	enable_pwm(self);
@@ -1821,7 +1827,8 @@ static int imx_pwm_led_probe(struct platform_device *pdev)
 	}
 
 	/* Configure but don't yet enable the PWM channel: */
-	if ((ret = config_pwm(self, pwm_period, pwm_prescaler, pwm_invert))) {
+	if ((ret = config_pwm(self, pwm_period, pwm_prescaler, pwm_invert,
+			      pwm_repeat))) {
 		goto failed_pwm_enable;
 	}
 	glb_data.num_leds++;
@@ -1904,6 +1911,11 @@ static int __init imx_pwm_led_init(void)
 	if (pwm_phase_offset > (MAX_UDELAY_MS * 1000)) {
 		pr_err("%s: value %u is invalid for pwm_phase_offset param\n",
 		       THIS_MODULE->name, pwm_phase_offset);
+		return -EINVAL;
+	}
+	if (pwm_repeat > MAX_PWM_REPEAT) {
+		pr_err("%s: value %u is invalid for pwm_repeat param\n",
+		       THIS_MODULE->name, pwm_repeat);
 		return -EINVAL;
 	}
 	if ((max_leds == 0) || (max_leds > 32)) {
