@@ -55,12 +55,14 @@
 #define DEVICE_PATH           "/dev/"
 #define DEVICE_NAME           "pwm_led"
 #define ARG_DUTY              2 /* SDMA output arg 'duty': register 2 */
-#define ARG_ACTIVE            6 /* SDMA input arg 'active': register 6 */
+#define ARG_ACTIVE            4 /* SDMA input arg 'active': register 4 */
+#define ARG_PRELOAD           6 /* SDMA input arg 'active': register 6 */
 #define ARG_END               7 /* SDMA input arg 'end': register 7 */
 #define DEFAULT_ACTIVE        1 /* Default 'active' value: true */
 #define DEFAULT_ADAPTIVE      0 /* Default 'adaptive' value: false */
 #define MAX_PWM_PRESCALER     4095
 #define MAX_PWM_REPEAT        3
+#define SLEEP_RANGE           10000 /* us */
 
 /** PWM Control Register */
 #define PWMCR                 0x00
@@ -169,6 +171,8 @@ struct imx_pwm_led {
 	int adaptive;
 	/** Index of the currently playing fade, or -1 if not playing one */
 	int playing_fade_idx;
+	/** PWM FIFO sample period in microseconds */
+	uint pwm_fifo_period_us;
 };
 
 /** Fade struct */
@@ -271,8 +275,9 @@ static struct glb_data glb_data;
 /** SDMA script compiled from ./imx_pwm_led_sdma.asm using sdma_asm.pl from
  *  http://billauer.co.il/blog/2011/10/imx-sdma-howto-assembler-linux/ */
 static const u32 sdma_script[] = {
-	0x0a000901, 0x69c80400, 0x69c86300, 0x03df7d09, 0x620a4e00,
-	0x7d036a2b, 0x01607df5, 0x6e2b0160, 0x7df20300, 0x01607def,
+	0x0a000901, 0x69c80400, 0x69c84e00, 0x7d070e00, 0x4c007d03,
+	0x6a2b0160, 0x7d016c2b, 0x630003df, 0x7d09620a, 0x4c007d03,
+	0x6a2b0160, 0x7dec6c2b, 0x01607de9, 0x03000160, 0x7de60000,
 };
 
 /*******************************************************************************
@@ -354,6 +359,9 @@ static int config_pwm(struct imx_pwm_led *self, u32 period, u32 prescaler,
 {
 	u32 cr;
 	uint clk;
+	uint pwm_freq;
+	uint pwm_freq_remainder;
+	uint pwm_freq_fraction;
 
 	/* Enable clocks */
 	int ret = 0;
@@ -383,9 +391,28 @@ static int config_pwm(struct imx_pwm_led *self, u32 period, u32 prescaler,
 
 	clk = clk_get_rate(self->clk_ipg);
 	clk /= prescaler + 1;
+	self->pwm_fifo_period_us = (period / (clk / 1000000)) << repeat;
+	pwm_freq = clk / period;
+	pwm_freq_remainder = clk % period;
+	pwm_freq_fraction =
+		((pwm_freq_remainder * 1000) + (period / 2)) / period;
+	/* Warn if sample_rate << repeat != PWM frequency, which will cause the
+	 * PWM FIFO to either run full or empty:
+	 * - If it runs full, samples will be lost, possibly including the last one.
+	 * - If it runs empty, a hardware bug/feature of the i.MX6UL may cause
+	 *   glitches in the output. While there is no official erratum, this issue
+	 *   is discussed here: https://community.nxp.com/thread/356855
+	 *   For other i.MX devices, this may not be an issue. */
+	if (((sample_rate << repeat) != pwm_freq) ||
+	    (pwm_freq_remainder != 0)) {
+		dev_warn(self->dev,
+			 "%s: sample_rate %u Hz << repeat %u "
+			 "!= pwm_freq %u.%03u Hz",
+			 __func__, sample_rate, repeat, pwm_freq,
+			 pwm_freq_fraction);
+	}
 	dev_dbg(self->dev, "%s: setting PWMPR: 0x%08x (%u.%03u Hz)", __func__,
-		period - 2, clk / period,
-		(((clk % period) * 1000) + (period / 2)) / period);
+		period - 2, pwm_freq, pwm_freq_fraction);
 	__raw_writel(period - 2, self->mmio_base + PWMPR);
 
 	/* Configure */
@@ -415,6 +442,44 @@ static void disable_pwm(struct imx_pwm_led *self)
 static inline void set_pwm_duty(struct imx_pwm_led *self, uint duty)
 {
 	__raw_writel(duty, self->mmio_base + PWMSAR);
+}
+
+static int wait_pwm_fifo_empty(struct imx_pwm_led *self)
+{
+	uint i;
+	uint level;
+	/* Make two attempts at waiting for the FIFO to empty: */
+	for (i = 0; i < 2; i++) {
+		uint min_sleep;
+		/* Get the number of samples in the PWM FIFO: */
+		level = __raw_readl(self->mmio_base + PWMSR) &
+			PWMSR_FIFOAV_MASK;
+		/* If the FIFO is empty:*/
+		if (level == 0) {
+			return 0;
+		}
+		/* Sleep until the FIFO should be empty: */
+		min_sleep = level * self->pwm_fifo_period_us;
+		dev_dbg(self->dev, "%s: level: %u, sleep: %u us", __func__,
+			level, min_sleep);
+		usleep_range(min_sleep, min_sleep + SLEEP_RANGE);
+	}
+	dev_err(self->dev, "%s: wait timeout, level: %u", __func__, level);
+	return -EFAULT;
+}
+
+static int wait_pwm_fifos_empty(uint led_mask)
+{
+	uint i;
+	for (i = 0; i < glb_data.num_leds; i++) {
+		if (led_mask & (1 << i)) {
+			int ret;
+			if ((ret = wait_pwm_fifo_empty(glb_data.leds[i]))) {
+				return ret;
+			}
+		}
+	}
+	return 0;
 }
 
 /*******************************************************************************
@@ -825,8 +890,9 @@ static int load_sdma_duty(struct imx_pwm_led *self, uint cue_idx, uint led_idx,
 	dev_dbg(self->dev, "%s: led: %u, duty: %u", __func__, led_idx, duty);
 	glb_data.duty_buf[duty_offset] = duty;
 
-	/* Write the ARG_END and MSA; as well as the MDA,
+	/* Write the ARG_PRELOAD, ARG_END and MSA; as well as the MDA,
 	 * since it's in the middle */
+	context.gReg[ARG_PRELOAD] = 1;
 	context.gReg[ARG_END] = duty_phys + sizeof(u16);
 	context.mda = self->mmio_base_phys + PWMSAR;
 	context.msa = duty_phys;
@@ -837,9 +903,10 @@ static int load_sdma_duty(struct imx_pwm_led *self, uint cue_idx, uint led_idx,
 	 * is only updated between iterations of our script. (i.e. registers
 	 * won't get suddenly updated while our script is running) */
 	ret = sdma_load_partial_context(
-		self->sdmac, (struct sdma_context_data *)&context.gReg[ARG_END],
-		offsetof(struct sdma_context_data, gReg[ARG_END]),
-		12); /* 3 * sizeof(u32) = 12 bytes */
+		self->sdmac,
+		(struct sdma_context_data *)&context.gReg[ARG_PRELOAD],
+		offsetof(struct sdma_context_data, gReg[ARG_PRELOAD]),
+		16); /* 4 * sizeof(u32) = 12 bytes */
 	if (ret) {
 		dev_err(self->dev, "%s: failed to load context", __func__);
 		return ret;
@@ -902,18 +969,21 @@ static int load_sdma_fade(struct imx_pwm_led *self, uint fade_idx)
 		offset = adapt_fade(self, fade, duty);
 	}
 
-	/* Write the ARG_END and MSA; as well as the MDA,
+	/* Write ARG_PRELOAD, ARG_END and MSA; as well as the MDA,
 	 * since it's in the middle */
+	context.gReg[ARG_PRELOAD] = 1;
 	context.gReg[ARG_END] = fade->buf_phys + fade->len;
 	context.mda = self->mmio_base_phys + PWMSAR;
 	context.msa = fade->buf_phys + offset;
 
 	ret = sdma_load_partial_context(
-		self->sdmac, (struct sdma_context_data *)&context.gReg[ARG_END],
-		offsetof(struct sdma_context_data, gReg[ARG_END]),
-		12); /* 3 * sizeof(u32) = 12 bytes */
+		self->sdmac,
+		(struct sdma_context_data *)&context.gReg[ARG_PRELOAD],
+		offsetof(struct sdma_context_data, gReg[ARG_PRELOAD]),
+		16); /* 4 * sizeof(u32) = 16 bytes */
 	if (ret) {
 		dev_err(self->dev, "%s: failed to load context", __func__);
+		goto out;
 	}
 
 	/* Set the playing fade index and increment the fade's player_count.
@@ -993,6 +1063,7 @@ static int set_sdma_active(struct imx_pwm_led *self, int active)
 		4); /* 1 * sizeof(u32) = 4 bytes */
 	if (ret) {
 		dev_err(self->dev, "%s: failed to load context", __func__);
+		return ret;
 	}
 	return 0;
 }
@@ -1007,6 +1078,7 @@ static int fetch_sdma_status(struct imx_pwm_led *self)
 		12); /* 3 * sizeof(u32) = 12 bytes */
 	if (ret) {
 		dev_err(self->dev, "%s: failed to fetch context", __func__);
+		return ret;
 	}
 	/* Return 1 if playing, and zero if not: */
 	ret = context.msa < context.gReg[ARG_END];
@@ -1323,15 +1395,23 @@ static long ioctl_set_duty(struct imx_pwm_led *self, unsigned long arg)
 		return -EINVAL;
 	}
 
+	/* Use the SDMA to load the duty rather than setting it directly so:
+	 * - the active status of the LED is taken into account,
+	 * - the preload workaround is applied (see imx_pwm_led_sdma.asm),
+	 * - adaptation of a subsequent fade is possible. */
+	/* 1. Stop our LED (it was already locked) */
 	if ((ret = stop_led(self))) {
 		return ret;
 	}
-	/* Use the SDMA to load the duty rather than setting it directly.
-	 * This will take into account whether the LED is active and allow
-	 * adaptation of a following fade: */
+	/* 2. Wait for the PWM FIFO to empty: */
+	if ((ret = wait_pwm_fifo_empty(self))) {
+		return ret;
+	}
+	/* 3. Load the duty */
 	if ((ret = load_sdma_duty(self, max_cues, self->led_idx, arg))) {
 		return ret;
 	}
+	/* 4. Start our LED (it will be unlocked later) */
 	start_led(self);
 	return 0;
 }
@@ -1398,11 +1478,15 @@ static long ioctl_play_fade(struct imx_pwm_led *self, unsigned long arg)
 	if ((ret = stop_led(self))) {
 		return ret;
 	}
-	/* 2. Load the fade */
+	/* 2. Wait for the PWM FIFO to empty: */
+	if ((ret = wait_pwm_fifo_empty(self))) {
+		return ret;
+	}
+	/* 3. Load the fade */
 	if ((ret = load_sdma_fade(self, arg))) {
 		return ret;
 	}
-	/* 3. Start our LED (it will be unlocked later) */
+	/* 4. Start our LED (it will be unlocked later) */
 	start_led(self);
 	return 0;
 }
@@ -1429,17 +1513,21 @@ static long ioctl_play_cue(struct imx_pwm_led *self, unsigned long arg)
 	if ((ret = stop_leds(self, led_mask))) {
 		goto out_led;
 	}
-	/* 5. Load the cue */
+	/* 5. Wait for the PWM FIFOs to empty: */
+	if ((ret = wait_pwm_fifos_empty(led_mask))) {
+		goto out_led;
+	}
+	/* 6. Load the cue */
 	if ((ret = load_sdma_cue(self, arg))) {
 		goto out_led;
 	}
-	/* 6. Start the LEDs */
+	/* 7. Start the LEDs */
 	start_leds(self, led_mask);
 out_led:
-	/* 7. Unlock the LEDs except our own, which will be unlocked later */
+	/* 8. Unlock the LEDs except our own, which will be unlocked later */
 	unlock_leds(led_mask & ~(1 << self->led_idx));
 out_cue:
-	/* 8. Finally unlock the cue */
+	/* 9. Finally unlock the cue */
 	mutex_unlock(&cue->lock);
 	return ret;
 }
