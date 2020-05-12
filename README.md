@@ -5,12 +5,13 @@ processors.
 
 The module supports pre-loading of 'fades' (a buffer of PWM duty-cycle samples)
 and 'cues' (a list of actions to perform on one or more PWM channels), that can
-then be triggered quickly later using `ioctl`.
+then be quickly triggered later using `ioctl`.
 
 Much of this code is adapted from the [imx-pwm-audio](https://github.com/Glowforge/kernel-module-imx-pwm-audio/)
 module from Glowforge and the [meta-openglow](https://github.com/ScottW514/meta-openglow)
 kernel patches from OpenGlow. The [i.MX SDMA assembler](http://billauer.co.il/blog/2011/10/imx-sdma-howto-assembler-linux/)
-from Eli Billauer was also used.
+from Eli Billauer, and [hints](https://community.nxp.com/thread/356855) from
+TomE for working round a hardware issue in the i.MX were also used.
 
 ## Quick-Start Guide
 Using [ioctl](https://github.com/jerome-pouiller/ioctl/):
@@ -44,7 +45,7 @@ The module creates devices for each PWM channel visible at `/dev/pwm_led0` to
 
 ### Definitions
 - A PWM 'period' is defined as a 16-bit PWM clock divider. For example, if the
-  PWM clock is 24 MHz, and the PWM period is 12000, the output PWM frequency
+  IPG clock is 24 MHz and the PWM period is 12000, the output PWM frequency
   will be 2 kHz.
 - A PWM 'duty-cycle value' is defined as a 16-bit counter value at which the
   output changes from 1 to 0, which can range from zero to the PWM period value.
@@ -109,6 +110,7 @@ The module has the following parameters (applicable to all channels):
     pwm_prescaler    - Default PWM prescaler, N-1 value, allowed range 0 to 4095
     pwm_invert       - Default PWM invert mode, 0=non-inverted, 1=inverted
     pwm_phase_offset - Channel phase offset in microseconds
+    pwm_repeat       - FIFO repeat value, 2^N value, allowed range 0 to 3
     max_fades        - Maximum number of fades
     max_cues         - Maximum number of cues
     max_leds         - Maximum number of LEDs (PWM channels)
@@ -146,6 +148,35 @@ resources while they are in use.
 
 **Note:** The fades are also protected against writing by the owning process
 whilst they are being played on a channel.
+
+## Hardware Glitch Issue
+### Background
+The i.MX53, i.MX6 (and possibly other devices from the i.MX family) suffer from
+a hardware bug/feature where glitches appear in the PWM output when the duty
+cycle is being ramped down from a high duty cycle to a lower duty cycle. For
+discussion of this issue see [here](https://community.nxp.com/thread/356855).
+For affected devices, the following statement in section 38.7.4 of the reference
+manual only holds when the FIFO is not empty:
+
+    "When a new value is written, the duty cycle changes after the current
+     period is over."
+
+To workaround this issue, the following two points must be met:
+1. When the FIFO is empty, the first sample added to the FIFO must be the
+   current duty cycle value from the PSWSAR.
+2. During playback, the rate at which the FIFO empties must match the rate at
+   which new samples are added to the FIFO. This will prevent the FIFO from
+   emptying or overflowing, which would respectively cause glitches or lost
+   samples.
+### Workaround
+This module implements point 1 above in the SDMA script. In order to meet point
+2, the following expression must be true:
+
+    sample_rate * pwm_period * (pwm_prescaler + 1) << pwm_repeat == ipg_clk
+
+Where `ipg_clk` is the PWM clock frequency. A warning is generated during device
+probing or `PWM_LED_CONFIGURE` if this condition is not met. For devices not
+affected by this issue, this warning can be safely ignored.
 
 ## Device Tree Bindings
 ```

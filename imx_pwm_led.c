@@ -359,9 +359,6 @@ static int config_pwm(struct imx_pwm_led *self, u32 period, u32 prescaler,
 {
 	u32 cr;
 	uint clk;
-	uint pwm_freq;
-	uint pwm_freq_remainder;
-	uint pwm_freq_fraction;
 
 	/* Enable clocks */
 	int ret = 0;
@@ -390,29 +387,31 @@ static int config_pwm(struct imx_pwm_led *self, u32 period, u32 prescaler,
 	__raw_writel(0, self->mmio_base + PWMSAR);
 
 	clk = clk_get_rate(self->clk_ipg);
-	clk /= prescaler + 1;
-	self->pwm_fifo_period_us = (period / (clk / 1000000)) << repeat;
-	pwm_freq = clk / period;
-	pwm_freq_remainder = clk % period;
-	pwm_freq_fraction =
-		((pwm_freq_remainder * 1000) + (period / 2)) / period;
-	/* Warn if sample_rate << repeat != PWM frequency, which will cause the
-	 * PWM FIFO to either run full or empty:
-	 * - If it runs full, samples will be lost, possibly including the last one.
-	 * - If it runs empty, a hardware bug/feature of the i.MX6UL may cause
-	 *   glitches in the output. While there is no official erratum, this issue
-	 *   is discussed here: https://community.nxp.com/thread/356855
-	 *   For other i.MX devices, this may not be an issue. */
-	if (((sample_rate << repeat) != pwm_freq) ||
-	    (pwm_freq_remainder != 0)) {
-		dev_warn(self->dev,
-			 "%s: sample_rate %u Hz << repeat %u "
-			 "!= pwm_freq %u.%03u Hz",
-			 __func__, sample_rate, repeat, pwm_freq,
-			 pwm_freq_fraction);
+	/* Sanity check of IPG clock frequency: */
+	if (clk < 1000000) {
+		dev_err(self->dev, "%s: invalid IPG clock: %u", __func__, clk);
+		return -EFAULT;
 	}
+	/* Warn if the PWM FIFO will either run full or empty:
+	 * - If it runs full, samples will be lost, possibly including the last
+	 *   one, which will leave the duty cycle at an unexpected value.
+	 * - If it runs empty, a hardware bug/feature of the i.MX can cause
+	 *   glitches in the output. While there is no official erratum, this
+	 *   issue is discussed here: https://community.nxp.com/thread/356855
+	 *   For unaffected devices, this warning can be safely ignored. */
+	if (((uint64_t)sample_rate * (uint64_t)period *
+		     (uint64_t)(prescaler + 1)
+	     << repeat) != clk) {
+		dev_warn(self->dev,
+			 "%s: sample_rate %u Hz * period %u * "
+			 "(prescaler %u + 1) << repeat %u != ipg_clk %u Hz",
+			 __func__, sample_rate, period, prescaler, repeat, clk);
+	}
+	self->pwm_fifo_period_us =
+		(period * (prescaler + 1) << repeat) / (clk / 1000000);
 	dev_dbg(self->dev, "%s: setting PWMPR: 0x%08x (%u.%03u Hz)", __func__,
-		period - 2, pwm_freq, pwm_freq_fraction);
+		period - 2, clk / (period * (prescaler + 1)),
+		((clk % (period * (prescaler + 1))) * 1000) / period);
 	__raw_writel(period - 2, self->mmio_base + PWMPR);
 
 	/* Configure */
