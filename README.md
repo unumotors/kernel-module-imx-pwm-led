@@ -56,7 +56,8 @@ The module creates devices for each PWM channel visible at `/dev/pwm_led0` to
   - A 'fade' is a buffer of PWM duty-cycle values of fixed sample rate. A fade
     can be played on a PWM channel, so that the output fades between the
     starting duty-cycle value and the finishing duty-cycle value. At the end of
-    the fade, the duty-cycle of the PWM channel is left at the last fade value.
+    the fade, the duty-cycle of the PWM channel is left at the last duty cycle
+    value.
   - A 'cue' is a list of actions to start on one or more channels at the same
     time. The supported actions are:
     - Starting playback of a fade on a given channel.
@@ -72,10 +73,8 @@ The module creates devices for each PWM channel visible at `/dev/pwm_led0` to
         #define PWM_LED_CUE_ACTION_BIT_TYPE  8
         #define PWM_LED_CUE_ACTION_BIT_VAL   16
         #define PWM_LED_CUE_ACTION_MASK_LED  0x0000001F
-        #define PWM_LED_CUE_ACTION_MASK_TYPE 0x00000F00 /* See below */
+        #define PWM_LED_CUE_ACTION_MASK_TYPE 0x00000F00 /* pwm_led_cue_action_type */
         #define PWM_LED_CUE_ACTION_MASK_VAL  0xFFFF0000
-        #define PWM_LED_CUE_ACTION_TYPE_FADE 0 /* Value=fade index */
-        #define PWM_LED_CUE_ACTION_TYPE_DUTY 1 /* Value=duty cycle */
 
   - For each channel the module has the following modes:
     - 'Adaptive': This is a configuration option. It causes the channel to
@@ -86,7 +85,7 @@ The module creates devices for each PWM channel visible at `/dev/pwm_led0` to
       the fade will be started at the point closest to 50%, rather than first
       jumping to 100%.
     - 'Active': This can be changed at run time. When a channel is active, the
-      values of a fade played on the channel will set be set as the channel's
+      values of a fade played on the channel will be set as the channel's
       duty-cycle, i.e. played as normal. When a channel is inactive, the fade
       value is not set as the channel's duty-cycle, instead a value of 0% is
       set.
@@ -185,7 +184,7 @@ Required properties:
 - unu,sdma-script-origin : **Only required for the first device**
   Location to load the SDMA script (in 32-bit data words).
   The 4KB SDMA internal RAM area for scripts and data is located at
-  0xc00 - 0xfff. The imx-pwm-led script is 10 words long.
+  0xc00 - 0xfff. The imx-pwm-led script is 15 words long.
 - unu,timer : **Only required for the first device** The EPIT timer used.
 - unu,sdma-channel : The SDMA channel number.
 
@@ -241,7 +240,7 @@ S = "${WORKDIR}/git"
 RPROVIDES_${PN} += "kernel-module-imx-pwm-led"
 
 do_install_append() {
-    install -d ${D}${includedir}/linux
-    install -m 0644 ${S}/pwm_led.h ${D}${includedir}/linux
+    install -d ${D}${includedir}/imx/linux
+    install -m 0644 ${S}/pwm_led.h ${D}${includedir}/imx/linux
 }
 ```

@@ -52,16 +52,19 @@
 #define PWM_LED_CFG_MASK_INVERT    0x10000000
 #define PWM_LED_CFG_MASK_REPEAT    0x60000000 /* 2^N value, range 0 to 3 */
 
+enum pwm_led_cue_action_type {
+	PWM_LED_CUE_ACTION_TYPE_FADE = 0, /* Cue action value=fade index */
+	PWM_LED_CUE_ACTION_TYPE_DUTY = 1  /* Cue action Value=duty cycle */
+}
+
 /** After a cue is opened using PWM_LED_OPEN_CUE, u32 'cue actions' shall be
  *  written to the device in the following format. */
 #define PWM_LED_CUE_ACTION_BIT_LED   0
 #define PWM_LED_CUE_ACTION_BIT_TYPE  8
 #define PWM_LED_CUE_ACTION_BIT_VAL   16
 #define PWM_LED_CUE_ACTION_MASK_LED  0x0000001F
-#define PWM_LED_CUE_ACTION_MASK_TYPE 0x00000F00 /* See PWM_LED_CUE_ACTION_TYPE_x */
+#define PWM_LED_CUE_ACTION_MASK_TYPE 0x00000F00 /* pwm_led_cue_action_type */
 #define PWM_LED_CUE_ACTION_MASK_VAL  0xFFFF0000
-#define PWM_LED_CUE_ACTION_TYPE_FADE 0 /* Value=fade index */
-#define PWM_LED_CUE_ACTION_TYPE_DUTY 1 /* Value=duty cycle */
 /* clang-format on */
 
 #endif /* PWM_LED_H */
