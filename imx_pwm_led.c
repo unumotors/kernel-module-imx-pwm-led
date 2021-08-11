@@ -339,18 +339,6 @@ static u32 convert_mask_led_to_sdma(uint led_mask)
 	return sdma_mask;
 }
 
-static u32 convert_mask_sdma_to_led(uint sdma_mask)
-{
-	uint i;
-	u32 led_mask = 0;
-	for (i = 0; i < g_data.num_leds; i++) {
-		if (sdma_mask & (1 << g_data.leds[i]->sdma_ch_num)) {
-			led_mask |= 1 << i;
-		}
-	}
-	return led_mask;
-}
-
 /*******************************************************************************
  * PWM FUNCTIONS
  ******************************************************************************/
@@ -652,29 +640,23 @@ static int check_cue(struct imx_pwm_led *self, uint cue_idx, uint *led_mask)
 
 static void start_led(struct imx_pwm_led *self)
 {
-	int old_enable;
 	/* Enable the sdma channel */
-	old_enable =
-		sdma_event_enable(self->sdmac, epit_sdma_event(g_data.epit));
+	sdma_event_enable(self->sdmac, epit_sdma_event(g_data.epit));
 	/* Set a nonzero priority to start the script */
 	sdma_set_channel_priority(self->sdmac, sdma_priority);
 	sdma_set_channel_pending(self->sdmac);
-	/* If the channel was already enabled: */
-	if (old_enable) {
-		return;
-	}
 	dev_dbg(self->dev, "%s", __func__);
 }
 
 static void start_leds(struct imx_pwm_led *self, uint led_mask)
 {
 	uint i;
-	u32 old_sdma_mask, sdma_mask, old_led_mask, started_led_mask;
+	u32 sdma_mask;
 
 	sdma_mask = convert_mask_led_to_sdma(led_mask);
 
 	/* Enable the sdma channels: */
-	old_sdma_mask = sdma_event_enable_by_channel_mask(
+	sdma_event_enable_by_channel_mask(
 		g_data.sdma, sdma_mask, epit_sdma_event(g_data.epit));
 	/* Set a nonzero priority to start the script */
 	for (i = 0; i < g_data.num_leds; i++) {
@@ -685,15 +667,7 @@ static void start_leds(struct imx_pwm_led *self, uint led_mask)
 	}
 	sdma_set_channel_pending_by_mask(g_data.sdma, sdma_mask);
 
-	old_led_mask = convert_mask_sdma_to_led(old_sdma_mask);
-
-	started_led_mask = (old_led_mask ^ led_mask) & led_mask;
-	/* If all the channels were already enabled: */
-	if (started_led_mask == 0) {
-		return;
-	}
-	dev_dbg(self->dev, "%s: 0x%08x, started: 0x%08x", __func__, led_mask,
-		started_led_mask);
+	dev_dbg(self->dev, "%s: 0x%08x", __func__, led_mask);
 }
 
 static void dec_fade_player_count(struct imx_pwm_led *self)
@@ -710,12 +684,7 @@ static void dec_fade_player_count(struct imx_pwm_led *self)
 static int stop_led(struct imx_pwm_led *self)
 {
 	/* Disable the sdma channel */
-	int old_enable =
-		sdma_event_disable(self->sdmac, epit_sdma_event(g_data.epit));
-	/* If the channel was already disabled: */
-	if (!old_enable) {
-		return 0;
-	}
+	sdma_event_disable(self->sdmac, epit_sdma_event(g_data.epit));
 	dev_dbg(self->dev, "%s", __func__);
 	dec_fade_player_count(self);
 	return 0;
@@ -724,26 +693,17 @@ static int stop_led(struct imx_pwm_led *self)
 static int stop_leds(struct imx_pwm_led *self, uint led_mask)
 {
 	uint i;
-	u32 old_sdma_mask, sdma_mask, old_led_mask, stopped_led_mask;
+	u32 sdma_mask;
 
 	sdma_mask = convert_mask_led_to_sdma(led_mask);
 
 	/* Disable the sdma channels */
-	old_sdma_mask = sdma_event_disable_by_channel_mask(
+	sdma_event_disable_by_channel_mask(
 		g_data.sdma, sdma_mask, epit_sdma_event(g_data.epit));
 
-	old_led_mask = convert_mask_sdma_to_led(old_sdma_mask);
-
-	stopped_led_mask = (old_led_mask ^ ~led_mask) & led_mask;
-
-	/* If all the channels were already disabled: */
-	if (stopped_led_mask == 0) {
-		return 0;
-	}
-	dev_dbg(self->dev, "%s: 0x%08x, stopped: 0x%08x", __func__, led_mask,
-		stopped_led_mask);
+	dev_dbg(self->dev, "%s: 0x%08x", __func__, led_mask);
 	for (i = 0; i < g_data.num_leds; i++) {
-		if (stopped_led_mask & (1 << i)) {
+		if (led_mask & (1 << i)) {
 			dec_fade_player_count(g_data.leds[i]);
 		}
 	}
@@ -1683,7 +1643,7 @@ static int probe_first_dev(struct platform_device *pdev)
 			goto failed_cue_actions_alloc;
 		}
 	}
-	g_data.duty_buf = dma_zalloc_coherent(&pdev->dev, get_duty_buf_size(),
+	g_data.duty_buf = dma_alloc_coherent(&pdev->dev, get_duty_buf_size(),
 						&g_data.duty_buf_phys,
 						GFP_KERNEL);
 	if (g_data.duty_buf == NULL) {
@@ -1695,7 +1655,7 @@ static int probe_first_dev(struct platform_device *pdev)
 		get_duty_buf_size(), g_data.duty_buf_phys);
 	for (i = 0; i < max_fades; i++) {
 		struct led_fade *fade = &g_data.fades[i];
-		fade->buf = dma_zalloc_coherent(&pdev->dev, max_fade_size,
+		fade->buf = dma_alloc_coherent(&pdev->dev, max_fade_size,
 						&fade->buf_phys, GFP_KERNEL);
 		if (fade->buf == NULL) {
 			dev_err(&pdev->dev, "probe: failed to allocate fade "
