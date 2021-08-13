@@ -1,56 +1,434 @@
-From 98a73a2f4ad09c4d305edff39cd2e4067bbc5c3e Mon Sep 17 00:00:00 2001
+From 00ba238ac9db3acb2aa8fde895ac4b9f65ce75f8 Mon Sep 17 00:00:00 2001
 From: Geoff Phillips <geoff@unumotors.com>
-Date: Mon, 18 May 2020 17:40:42 +0200
-Subject: [PATCH] Expose SDMA API
+Date: Tue, 5 May 2020 17:15:59 +0200
+Subject: [PATCH] Apply EPIT, SDMA patches, configure DTS
 
-Patches based on meta-openglow patches:
-https://github.com/ScottW514/meta-openglow
-Additional interfaces:
-- sdma_set_channel_pending_by_mask
-- sdma_event_enable_by_channel_mask
-- sdma_event_disable_by_channel_mask
-- sdma_is_event_enabled
-Added spinlock locking to and return the old value to:
-- sdma_event_enable
-- sdma_event_disable
+Remove redundant DTS file
+Tidy up DTS file, configure EPIT and PWMs
 ---
- drivers/dma/imx-sdma.c                     | 581 +++++++++++++--------
- include/linux/platform_data/dma-imx-sdma.h | 328 +++++++++++-
- 2 files changed, 697 insertions(+), 212 deletions(-)
+ arch/arm/mach-imx/Kconfig                  |  22 +
+ arch/arm/mach-imx/Makefile                 |   2 +
+ arch/arm/mach-imx/epit_api.c               | 333 +++++++++++++++
+ drivers/dma/imx-sdma.c                     | 453 ++++++++++++++-------
+ include/linux/platform_data/dma-imx-sdma.h | 319 ++++++++++++++-
+ include/linux/platform_data/epit-imx.h     | 141 +++++++
+ 6 files changed, 1130 insertions(+), 140 deletions(-)
+ create mode 100644 arch/arm/mach-imx/epit_api.c
+ create mode 100644 include/linux/platform_data/epit-imx.h
 
+diff --git a/arch/arm/mach-imx/Kconfig b/arch/arm/mach-imx/Kconfig
+index cb6340b2eb33..763ef90d4289 100644
+--- a/arch/arm/mach-imx/Kconfig
++++ b/arch/arm/mach-imx/Kconfig
+@@ -33,6 +33,27 @@ config MXC_DEBUG_BOARD
+ 	  data/address de-multiplexing and decode, signal level shift,
+ 	  interrupt control and various board functions.
+ 
++config HAVE_EPIT
++	bool
++
++config MXC_USE_EPIT
++	bool "Use EPIT instead of GPT"
++	depends on HAVE_EPIT
++	help
++	  Use EPIT as the system timer on systems that have it. Normally you
++	  don't have a reason to do so as the EPIT has the same features and
++	  uses the same clocks as the GPT. Anyway, on some systems the GPT
++	  may be in use for other purposes.
++
++config MXC_EPIT_API
++	bool "Allow EPIT1/EPIT2 to be used in kernel modules"
++	depends on !MXC_USE_EPIT
++	help
++		Exposes an API for EPIT1/EPIT2.
++
++config HAVE_IMX_RNG
++       bool
++
+ config HAVE_IMX_ANATOP
+ 	bool
+ 
+@@ -94,6 +115,7 @@ config SOC_IMX31
+ config SOC_IMX35
+ 	bool
+ 	select ARCH_MXC_IOMUX_V3
++	select HAVE_EPIT
+ 	select MXC_AVIC
+ 	select PINCTRL_IMX35
+ 
+diff --git a/arch/arm/mach-imx/Makefile b/arch/arm/mach-imx/Makefile
+index 98a07af52779..dd544fc00c67 100644
+--- a/arch/arm/mach-imx/Makefile
++++ b/arch/arm/mach-imx/Makefile
+@@ -20,6 +20,8 @@ obj-$(CONFIG_ARCH_MXC_IOMUX_V3) += iomux-v3.o
+ obj-$(CONFIG_MXC_TZIC) += tzic.o
+ obj-$(CONFIG_MXC_AVIC) += avic.o
+ 
++obj-$(CONFIG_MXC_USE_EPIT) += epit.o
++obj-$(CONFIG_MXC_EPIT_API) += epit_api.o
+ obj-$(CONFIG_MXC_DEBUG_BOARD) += 3ds_debugboard.o
+ 
+ ifeq ($(CONFIG_CPU_IDLE),y)
+diff --git a/arch/arm/mach-imx/epit_api.c b/arch/arm/mach-imx/epit_api.c
+new file mode 100644
+index 000000000000..8106575dde29
+--- /dev/null
++++ b/arch/arm/mach-imx/epit_api.c
+@@ -0,0 +1,333 @@
++/**
++ * Low-level i.MX6 EPIT API.
++ * Copyright (C) 2018 Scott Wiederhold <s.e.wiederhold@gmail.com>
++ * Portions Copyright (C) 2015-2018 Glowforge, Inc. <opensource@glowforge.com>
++ */
++
++#include <linux/platform_data/epit-imx.h>
++#include <linux/clk.h>
++#include <linux/device.h>
++#include <linux/interrupt.h>
++#include <linux/io.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/of_platform.h>
++#include <linux/platform_device.h>
++#include <linux/regmap.h>
++#include <linux/mfd/syscon.h>
++#include <linux/mfd/syscon/imx6q-iomuxc-gpr.h>
++
++/* Register offsets */
++#define EPITCR              0x00  /* control register */
++#define EPITSR              0x04  /* status register */
++#define EPITLR              0x08  /* load register */
++#define EPITCMPR            0x0c  /* compare register */
++#define EPITCNR             0x10  /* counter register */
++
++/* Control register bits */
++#define EPITCR_EN                 (1 << 0)
++#define EPITCR_ENMOD              (1 << 1)
++#define EPITCR_OCIEN              (1 << 2)
++#define EPITCR_RLD                (1 << 3)
++#define EPITCR_PRESC(x)           (((x) & 0xfff) << 4)
++#define EPITCR_SWR                (1 << 16)
++#define EPITCR_IOVW               (1 << 17)
++#define EPITCR_DBGEN              (1 << 18)
++#define EPITCR_WAITEN             (1 << 19)
++#define EPITCR_RES                (1 << 20)
++#define EPITCR_STOPEN             (1 << 21)
++#define EPITCR_OM_DISCON          (0 << 22)
++#define EPITCR_OM_TOGGLE          (1 << 22)
++#define EPITCR_OM_CLEAR           (2 << 22)
++#define EPITCR_OM_SET             (3 << 22)
++#define EPITCR_CLKSRC_OFF         (0 << 24)
++#define EPITCR_CLKSRC_PERIPHERAL  (1 << 24)
++#define EPITCR_CLKSRC_REF_HIGH    (2 << 24)
++#define EPITCR_CLKSRC_REF_LOW     (3 << 24)
++
++/* Status register bits */
++#define EPITSR_OCIF               (1 << 0)
++
++struct epit {
++	void __iomem *base;
++	struct clk *clk;
++	unsigned long rate;
++	u32 base_phys;
++	int irq;
++	int sdma_event;
++	epit_cb callback;
++	void *cb_arg;
++};
++
++static irqreturn_t epit_irq_handler_freerunning(int irq, void *dev_id)
++{
++	struct epit *epit = dev_id;
++	/* clear previous interrupt status */
++	__raw_writel(EPITSR_OCIF, epit->base+EPITSR);
++	/* call the callback */
++	epit->callback(epit->cb_arg);
++	return IRQ_HANDLED;
++}
++
++static irqreturn_t epit_irq_handler_oneshot(int irq, void *dev_id)
++{
++	struct epit *epit = dev_id;
++	u32 val;
++
++	/* clear previous interrupt status */
++	__raw_writel(EPITSR_OCIF, epit->base+EPITSR);
++	/* stop counting */
++	val = __raw_readl(epit->base+EPITCR);
++	val &= ~EPITCR_EN;
++	__raw_writel(val, epit->base+EPITCR);
++	/* call the callback */
++	epit->callback(epit->cb_arg);
++	return IRQ_HANDLED;
++}
++
++static int epit_init(struct epit *epit, epit_cb callback,
++	void *cb_arg, irqreturn_t (*irq_handler)(int, void *))
++{
++	u32 val;
++	int ret = 0;
++	/* zero out control register */
++	__raw_writel(0, epit->base+EPITCR);
++	/* clear previous interrupt status */
++	__raw_writel(EPITSR_OCIF, epit->base+EPITSR);
++	/* set counter reset value */
++	__raw_writel(0, epit->base+EPITLR);
++	/* zero out compare register */
++	__raw_writel(0, epit->base+EPITCMPR);
++	/* set mode and clock source; enable interrupt */
++	/* peripheral clock is 66MHz */
++	val = EPITCR_CLKSRC_REF_HIGH|EPITCR_WAITEN|EPITCR_RLD|EPITCR_OCIEN
++		|EPITCR_ENMOD;
++	__raw_writel(val, epit->base+EPITCR);
++	/* set up callback, register an IRQ handler if necessary */
++	epit->callback = callback;
++	epit->cb_arg = cb_arg;
++	if (callback) {
++		ret = request_irq(epit->irq, irq_handler,
++			IRQF_TIMER|IRQF_IRQPOLL, "epit", epit);
++		if (ret) { epit->callback = NULL; }
++	}
++	return ret;
++}
++
++int epit_init_freerunning(struct epit *epit, epit_cb callback, void *cb_arg)
++{
++	return epit_init(epit, callback, cb_arg, epit_irq_handler_freerunning);
++}
++EXPORT_SYMBOL(epit_init_freerunning);
++
++int epit_init_oneshot(struct epit *epit, epit_cb callback, void *cb_arg)
++{
++	return epit_init(epit, callback, cb_arg, epit_irq_handler_oneshot);
++}
++EXPORT_SYMBOL(epit_init_oneshot);
++
++u32 epit_hz_to_divisor(struct epit *epit, u32 hz)
++{
++	return (hz) ? epit->rate/hz : 0;
++}
++EXPORT_SYMBOL(epit_hz_to_divisor);
++
++void epit_start(struct epit *epit, u32 divisor)
++{
++	u32 val;
++	/* clear previous interrupt status */
++	__raw_writel(EPITSR_OCIF, epit->base+EPITSR);
++	/* set divisor */
++	__raw_writel(divisor, epit->base+EPITLR);
++	/* start counting */
++	val = __raw_readl(epit->base+EPITCR);
++	val |= EPITCR_EN;
++	__raw_writel(val, epit->base+EPITCR);
++}
++EXPORT_SYMBOL(epit_start);
++
++void epit_start_hz(struct epit *epit, u32 hz)
++{
++	epit_start(epit, epit_hz_to_divisor(epit, hz));
++}
++EXPORT_SYMBOL(epit_start_hz);
++
++void epit_stop(struct epit *epit)
++{
++	/* stop counting */
++	u32 val = __raw_readl(epit->base+EPITCR);
++	val &= ~EPITCR_EN;
++	__raw_writel(val, epit->base+EPITCR);
++}
++EXPORT_SYMBOL(epit_stop);
++
++void epit_set_divisor(struct epit *epit, u32 divisor)
++{
++	__raw_writel(divisor, epit->base+EPITLR);
++}
++EXPORT_SYMBOL(epit_set_divisor);
++
++void epit_set_hz(struct epit *epit, u32 hz)
++{
++	epit_set_divisor(epit, epit_hz_to_divisor(epit, hz));
++}
++EXPORT_SYMBOL(epit_set_hz);
++
++u32 epit_count(struct epit *epit)
++{
++	return __raw_readl(epit->base+EPITCNR);
++}
++EXPORT_SYMBOL(epit_count);
++
++int epit_is_running(struct epit *epit)
++{
++	return (__raw_readl(epit->base+EPITCR) & EPITCR_EN) != 0;
++}
++EXPORT_SYMBOL(epit_is_running);
++
++int epit_irq(struct epit *epit)
++{
++	return epit->irq;
++}
++EXPORT_SYMBOL(epit_irq);
++
++int epit_sdma_event(struct epit *epit)
++{
++	return epit->sdma_event;
++}
++EXPORT_SYMBOL(epit_sdma_event);
++
++u32 epit_status_register_address(struct epit *epit)
++{
++	return epit->base_phys+EPITSR;
++}
++EXPORT_SYMBOL(epit_status_register_address);
++
++struct epit *epit_get(struct device_node *np)
++{
++	struct platform_device *pdev = of_find_device_by_node(np);
++	struct epit *epit = NULL;
++	if (!pdev) { return NULL; }
++	epit = platform_get_drvdata(pdev);
++	return epit;
++}
++EXPORT_SYMBOL(epit_get);
++
++static ssize_t status_show(struct device *dev, struct device_attribute *attr, char *buf)
++{
++	struct platform_device *pdev = to_platform_device(dev);
++	struct epit *epit = platform_get_drvdata(pdev);
++  	return scnprintf(buf, PAGE_SIZE,
++		"CR=%04x SR=%04x LR=%04x CMPR=%04x CNR=%04x\n",
++		__raw_readl(epit->base+EPITCR),
++		__raw_readl(epit->base+EPITSR),
++		__raw_readl(epit->base+EPITLR),
++		__raw_readl(epit->base+EPITCMPR),
++		__raw_readl(epit->base+EPITCNR)
++	);
++}
++static DEVICE_ATTR(status, S_IRUSR, status_show, NULL);
++
++static int epit_probe(struct platform_device *pdev)
++{
++	struct epit *epit;
++	struct device_node *np = pdev->dev.of_node;
++
++	/* allocate driver data */
++	epit = devm_kzalloc(&pdev->dev, sizeof(*epit), GFP_KERNEL);
++	if (!epit) {
++		return -ENOMEM;
++	}
++	platform_set_drvdata(pdev, epit);
++
++	/* map registers */
++	epit->base = devm_ioremap_resource(&pdev->dev, pdev->resource);
++	if (unlikely(IS_ERR(epit->base))) {
++		return PTR_ERR(epit->base);
++	}
++	epit->base_phys = pdev->resource->start;
++
++	/* get irq */
++	epit->irq = platform_get_irq(pdev, 0);
++	if (unlikely(epit->irq < 0)) {
++		return -EINVAL;
++	}
++
++	/* get clock */
++	epit->clk = of_clk_get(np, 0);
++	if (IS_ERR(epit->clk)) {
++		return -EINVAL;
++	}
++	clk_prepare_enable(epit->clk);
++
++	/* get SDMA event */
++	if (unlikely(of_property_read_u32(np, "sdma-event",
++		&epit->sdma_event) != 0)) {
++		epit->sdma_event = -1;
++	}
++	/* event may need to be explicitly selected */
++	if (of_find_property(np, "sdma-event-select", NULL)) {
++		struct of_phandle_args args;
++		if (of_parse_phandle_with_fixed_args(np,
++		  "sdma-event-select", 3, 0, &args) == 0) {
++			struct regmap *gpr = syscon_node_to_regmap(args.np);
++			if (!IS_ERR(gpr)) {
++				regmap_update_bits(gpr,
++					args.args[0],
++					args.args[1],
++					args.args[2]);
++			} else {
++				dev_err(&pdev->dev, "regmap not found, "
++					"cannot enable SDMA event\n");
++			}
++			of_node_put(args.np);
++		} else {
++			dev_err(&pdev->dev, "invalid sdma-event-select params");
++		}
++	}
++
++	/* zero out control register and clear previous interrupt status */
++	__raw_writel(0, epit->base+EPITCR);
++	__raw_writel(EPITSR_OCIF, epit->base+EPITSR);
++
++	epit->rate = clk_get_rate(epit->clk);
++	dev_info(&pdev->dev, "irq=%d, rate=%ld, sdma_event=%d\n",
++		epit->irq, epit->rate, epit->sdma_event);
++
++	/* Create SYSFS entry for debugging purposes */
++	device_create_file(&pdev->dev, &dev_attr_status);
++
++	return 0;
++}
++
++static int epit_remove(struct platform_device *pdev)
++{
++	/* all resources released by devm */
++	struct epit *epit = platform_get_drvdata(pdev);
++	epit_stop(epit);
++	if (epit->callback) {
++		free_irq(epit->irq, epit);
++	}
++	clk_disable_unprepare(epit->clk);
++	return 0;
++}
++
++static const struct of_device_id epit_dt_ids[] = {
++	{ .compatible = "fsl,imx6ul-epit" },
++	{ /* sentinel */ }
++};
++MODULE_DEVICE_TABLE(of, epit_dt_ids);
++
++static struct platform_driver epit_driver = {
++	.driver = {
++		.name = "epit",
++		.owner = THIS_MODULE,
++		.of_match_table = epit_dt_ids
++	},
++	.probe = epit_probe,
++	.remove = epit_remove
++};
++module_platform_driver(epit_driver);
++
++MODULE_LICENSE("GPL v2");
++MODULE_AUTHOR("Scott Wiederhold <s.e.wiederhold@gmail.com>");
 diff --git a/drivers/dma/imx-sdma.c b/drivers/dma/imx-sdma.c
-index bc3922fd7fac..9adf3cb5abc9 100644
+index 09ae4282ad56..182be7bfd46d 100644
 --- a/drivers/dma/imx-sdma.c
 +++ b/drivers/dma/imx-sdma.c
-@@ -34,6 +34,7 @@
+@@ -26,6 +26,7 @@
+ #include <linux/device.h>
  #include <linux/genalloc.h>
  #include <linux/dma-mapping.h>
- #include <linux/dmapool.h>
 +#include <linux/dmapool.h>
  #include <linux/firmware.h>
  #include <linux/slab.h>
  #include <linux/platform_device.h>
-@@ -184,129 +185,6 @@
- #define SDMA_WATERMARK_LEVEL_HWE	BIT(29)
- #define SDMA_WATERMARK_LEVEL_CONT	BIT(31)
+@@ -194,139 +195,6 @@
+ #define SDMA_WATERMARK_LEVEL_SW_DONE	BIT(23)
+ #define SDMA_WATERMARK_LEVEL_SW_DONE_SEL_OFF 24
  
--#define SDMA_DMA_BUSWIDTHS	(BIT(DMA_SLAVE_BUSWIDTH_1_BYTE) | \
--				 BIT(DMA_SLAVE_BUSWIDTH_2_BYTES) | \
--				 BIT(DMA_SLAVE_BUSWIDTH_3_BYTES) | \
--				 BIT(DMA_SLAVE_BUSWIDTH_4_BYTES))
--
--#define SDMA_DMA_DIRECTIONS	(BIT(DMA_DEV_TO_MEM) | \
--				 BIT(DMA_MEM_TO_DEV) | \
--				 BIT(DMA_DEV_TO_DEV))
--
--#define SDMA_WATERMARK_LEVEL_FIFOS_OFF	8
--#define SDMA_WATERMARK_LEVEL_SW_DONE	BIT(23)
--#define SDMA_WATERMARK_LEVEL_SW_DONE_SEL_OFF 24
--
 -/*
 - * Mode/Count of data node descriptors - IPCv2
 - */
 -struct sdma_mode_count {
+-#define SDMA_BD_MAX_CNT	0xffff
 -	u32 count   : 16; /* size of the buffer pointed by this BD */
 -	u32 status  :  8; /* E,R,I,C,W,D status bits stored here */
 -	u32 command :  8; /* command mostly used for channel 0 */
@@ -68,9 +446,9 @@ index bc3922fd7fac..9adf3cb5abc9 100644
 -/**
 - * struct sdma_channel_control - Channel control Block
 - *
-- * @current_bd_ptr	current buffer descriptor processed
-- * @base_bd_ptr		first element of buffer descriptor array
-- * @unused		padding. The SDMA engine expects an array of 128 byte
+- * @current_bd_ptr:	current buffer descriptor processed
+- * @base_bd_ptr:	first element of buffer descriptor array
+- * @unused:		padding. The SDMA engine expects an array of 128 byte
 - *			control blocks
 - */
 -struct sdma_channel_control {
@@ -83,10 +461,13 @@ index bc3922fd7fac..9adf3cb5abc9 100644
 - * struct sdma_state_registers - SDMA context for a channel
 - *
 - * @pc:		program counter
+- * @unused1:	unused
 - * @t:		test bit: status of arithmetic & test instruction
 - * @rpc:	return program counter
+- * @unused0:	unused
 - * @sf:		source fault while loading data
 - * @spc:	loop start program counter
+- * @unused2:	unused
 - * @df:		destination fault while storing data
 - * @epc:	loop end program counter
 - * @lm:		loop mode
@@ -124,6 +505,14 @@ index bc3922fd7fac..9adf3cb5abc9 100644
 - * @dsa:		dedicated core source address register
 - * @ds:			dedicated core status register
 - * @dd:			dedicated core data register
+- * @scratch0:		1st word of dedicated ram for context switch
+- * @scratch1:		2nd word of dedicated ram for context switch
+- * @scratch2:		3rd word of dedicated ram for context switch
+- * @scratch3:		4th word of dedicated ram for context switch
+- * @scratch4:		5th word of dedicated ram for context switch
+- * @scratch5:		6th word of dedicated ram for context switch
+- * @scratch6:		7th word of dedicated ram for context switch
+- * @scratch7:		8th word of dedicated ram for context switch
 - */
 -struct sdma_context_data {
 -	struct sdma_state_registers  channel_state;
@@ -152,20 +541,29 @@ index bc3922fd7fac..9adf3cb5abc9 100644
 -	u32  scratch7;
 -} __attribute__ ((packed));
 -
--#define NUM_BD (int)(PAGE_SIZE / sizeof(struct sdma_buffer_descriptor))
--#define SDMA_BD_MAX_CNT	0xfffc /* align with 4 bytes */
 -
 -struct sdma_engine;
 -
+-/**
+- * struct sdma_desc - descriptor structor for one transfer
+- * @vd:			descriptor for virt dma
+- * @num_bd:		number of descriptors currently handling
+- * @bd_phys:		physical address of bd
+- * @buf_tail:		ID of the buffer that was processed
+- * @buf_ptail:		ID of the previous buffer that was processed
+- * @period_len:		period length, used in cyclic.
+- * @chn_real_count:	the real count updated from bd->mode.count
+- * @chn_count:		the transfer count set
+- * @sdmac:		sdma_channel pointer
+- * @bd:			pointer of allocate bd
+- */
  struct sdma_desc {
- 	struct virt_dma_desc		vd;
- 	struct list_head		node;
-@@ -362,11 +240,13 @@ struct sdma_channel {
- 	u32				bd_size_sum;
- 	bool				src_dualfifo;
- 	bool				dst_dualfifo;
--	unsigned int			fifo_num;
- 	struct dma_pool			*bd_pool;
+ 	struct virt_dma_desc	vd;
+ 	unsigned int		num_bd;
+@@ -399,9 +267,12 @@ struct sdma_channel {
+ 	unsigned int			fifo_num;
+ 	bool				sw_done;
+ 	u32				sw_done_sel;
 +	struct dma_async_tx_descriptor 	cb;
 +	struct tasklet_struct		cb_task;
  };
@@ -175,74 +573,21 @@ index bc3922fd7fac..9adf3cb5abc9 100644
  
  #define MAX_DMA_CHANNELS 32
  #define MXC_SDMA_DEFAULT_PRIORITY 1
-@@ -434,16 +314,25 @@ struct sdma_engine {
- 	u32				spba_end_addr;
- 	unsigned int			irq;
- 	struct gen_pool 		*iram_pool;
-+	void				*tiny_datamem_buf;
-+	dma_addr_t			tiny_datamem_buf_phys;
- 	/* channel0 bd */
- 	dma_addr_t			bd0_phys;
- 	bool				bd0_iram;
- 	struct sdma_buffer_descriptor	*bd0;
- 	bool				suspend_off;
--	int				idx;
--	/* clock ration for AHB:SDMA core. 1:1 is 1, 2:1 is 0*/
--	bool				clk_ratio;
-+	spinlock_t			event_enable_lock;
- };
+@@ -501,6 +372,8 @@ static int sdma_get_firmware(struct sdma_engine *sdma,
+ static int sdma_get_firmware_wait(struct sdma_engine *sdma,
+ 		const char *fw_name);
  
-+/**
-+ * If nonzero, sdma_write_datamem()/sdma_fetch_datamem()
-+ * use a single preallocated temporary buffer for transfers whose size is
-+ * less than or equal to this value.
-+ */
-+#define TINY_DATAMEM_BUF_SIZE	PAGE_SIZE
-+
 +static struct sdma_engine *sdma_singleton = NULL;
 +
  static struct sdma_driver_data sdma_imx31 = {
  	.chnenbl0 = SDMA_CHNENBL0_IMX31,
  	.num_events = 32,
-@@ -575,12 +464,6 @@ static struct sdma_driver_data sdma_imx7d = {
- 	.script_addrs = &sdma_script_imx7d,
- };
- 
--static struct sdma_driver_data sdma_imx8m = {
--	.chnenbl0 = SDMA_CHNENBL0_IMX35,
--	.num_events = 48,
--	.script_addrs = &sdma_script_imx7d,
--};
--
- static const struct platform_device_id sdma_devtypes[] = {
- 	{
- 		.name = "imx25-sdma",
-@@ -606,9 +489,6 @@ static const struct platform_device_id sdma_devtypes[] = {
- 	}, {
- 		.name = "imx7d-sdma",
- 		.driver_data = (unsigned long)&sdma_imx7d,
--	}, {
--		.name = "imx8mq-sdma",
--		.driver_data = (unsigned long)&sdma_imx8m,
- 	}, {
- 		/* sentinel */
- 	}
-@@ -625,18 +505,22 @@ static const struct of_device_id sdma_dt_ids[] = {
- 	{ .compatible = "fsl,imx31-sdma", .data = &sdma_imx31, },
- 	{ .compatible = "fsl,imx25-sdma", .data = &sdma_imx25, },
- 	{ .compatible = "fsl,imx7d-sdma", .data = &sdma_imx7d, },
--	{ .compatible = "fsl,imx8mq-sdma", .data = &sdma_imx8m, },
- 	{ /* sentinel */ }
- };
- MODULE_DEVICE_TABLE(of, sdma_dt_ids);
- 
--static int sdma_dev_idx;
--
- #define SDMA_H_CONFIG_DSPDMA	BIT(12) /* indicates if the DSPDMA is used */
- #define SDMA_H_CONFIG_RTD_PINS	BIT(11) /* indicates if Real-Time Debug pins are enabled */
+@@ -713,13 +586,23 @@ MODULE_DEVICE_TABLE(of, sdma_dt_ids);
  #define SDMA_H_CONFIG_ACR	BIT(4)  /* indicates if AHB freq /core freq = 2 or 1 */
  #define SDMA_H_CONFIG_CSM	(3)       /* indicates which context switch mode is selected*/
  
++static void sdma_start_desc(struct sdma_channel *sdmac);
++
 +/* returns an address in data space (32-bit words) */
 +u32 sdma_channel_context_base(int ch)
 +{
@@ -250,10 +595,10 @@ index bc3922fd7fac..9adf3cb5abc9 100644
 +}
 +EXPORT_SYMBOL(sdma_channel_context_base);
 +
- static void sdma_start_desc(struct sdma_channel *sdmac);
- 
++
  static inline u32 chnenbl_ofs(struct sdma_engine *sdma, unsigned int event)
-@@ -645,7 +529,7 @@ static inline u32 chnenbl_ofs(struct sdma_engine *sdma, unsigned int event)
+ {
+ 	u32 chnenbl0 = sdma->drvdata->chnenbl0;
  	return chnenbl0 + event * 4;
  }
  
@@ -262,7 +607,7 @@ index bc3922fd7fac..9adf3cb5abc9 100644
  		bool event_override, bool mcu_override, bool dsp_override)
  {
  	struct sdma_engine *sdma = sdmac->sdma;
-@@ -680,6 +564,7 @@ static int sdma_config_ownership(struct sdma_channel *sdmac,
+@@ -754,6 +637,7 @@ static int sdma_config_ownership(struct sdma_channel *sdmac,
  
  	return 0;
  }
@@ -270,7 +615,7 @@ index bc3922fd7fac..9adf3cb5abc9 100644
  
  static void sdma_enable_channel(struct sdma_engine *sdma, int channel)
  {
-@@ -708,7 +593,7 @@ static int sdma_run_channel0(struct sdma_engine *sdma)
+@@ -785,7 +669,7 @@ static int sdma_run_channel0(struct sdma_engine *sdma)
  	return ret;
  }
  
@@ -279,12 +624,64 @@ index bc3922fd7fac..9adf3cb5abc9 100644
  		u32 address)
  {
  	struct sdma_buffer_descriptor *bd0 = sdma->bd0;
-@@ -747,30 +632,186 @@ static int sdma_load_script(struct sdma_engine *sdma, void *buf, int size,
+@@ -823,8 +707,9 @@ static int sdma_load_script(struct sdma_engine *sdma, void *buf, int size,
  
  	return ret;
  }
 +EXPORT_SYMBOL(sdma_load_script);
+ 
+-static void sdma_event_enable(struct sdma_channel *sdmac, unsigned int event)
++void sdma_event_enable(struct sdma_channel *sdmac, unsigned int event)
+ {
+ 	struct sdma_engine *sdma = sdmac->sdma;
+ 	int channel = sdmac->channel;
+@@ -850,8 +735,21 @@ static void sdma_event_enable(struct sdma_channel *sdmac, unsigned int event)
+ 	}
+ 
+ }
++EXPORT_SYMBOL(sdma_event_enable);
+ 
+-static void sdma_event_disable(struct sdma_channel *sdmac, unsigned int event)
++void sdma_event_enable_by_channel_mask(struct sdma_engine *sdma,
++	unsigned int channel_mask, unsigned int event)
++{
++	unsigned long val;
++	u32 chnenbl = chnenbl_ofs(sdma, event);
 +
++	val = readl_relaxed(sdma->regs + chnenbl);
++	val |= channel_mask;
++	writel_relaxed(val, sdma->regs + chnenbl);
++}
++EXPORT_SYMBOL(sdma_event_enable_by_channel_mask);
++
++void sdma_event_disable(struct sdma_channel *sdmac, unsigned int event)
+ {
+ 	struct sdma_engine *sdma = sdmac->sdma;
+ 	int channel = sdmac->channel;
+@@ -862,6 +760,19 @@ static void sdma_event_disable(struct sdma_channel *sdmac, unsigned int event)
+ 	__clear_bit(channel, &val);
+ 	writel_relaxed(val, sdma->regs + chnenbl);
+ }
++EXPORT_SYMBOL(sdma_event_disable);
++
++void sdma_event_disable_by_channel_mask(struct sdma_engine *sdma,
++	unsigned int channel_mask, unsigned int event)
++{
++	unsigned long val;
++	u32 chnenbl = chnenbl_ofs(sdma, event);
++
++	val = readl_relaxed(sdma->regs + chnenbl);
++	val &= ~channel_mask;
++	writel_relaxed(val, sdma->regs + chnenbl);
++}
++EXPORT_SYMBOL(sdma_event_disable_by_channel_mask);
+ 
+ static struct sdma_desc *to_sdma_desc(struct dma_async_tx_descriptor *t)
+ {
+@@ -892,6 +803,119 @@ static void sdma_start_desc(struct sdma_channel *sdmac)
+ 	sdma_enable_channel(sdma, sdmac->channel);
+ }
+ 
 +int sdma_write_datamem(struct sdma_engine *sdma, void *buf, int size,
 +		u32 address)
 +{
@@ -294,20 +691,20 @@ index bc3922fd7fac..9adf3cb5abc9 100644
 +	int ret;
 +	unsigned long flags;
 +	bool use_iram = true;
-+	bool tiny = (size <= TINY_DATAMEM_BUF_SIZE);
 +
-+	if (!tiny) {
++	if (sdma->iram_pool) {
 +		buf_virt = gen_pool_dma_alloc(sdma->iram_pool, size, &buf_phys);
-+		if (!buf_virt) {
-+			use_iram = false;
-+			buf_virt = dma_alloc_coherent(NULL, size, &buf_phys,
-+					GFP_KERNEL);
-+			if (!buf_virt)
-+				return -ENOMEM;
-+		}
 +	} else {
-+		buf_virt = sdma->tiny_datamem_buf;
-+		buf_phys = sdma->tiny_datamem_buf_phys;
++		buf_virt = dma_alloc_coherent(sdma->dev, size, &buf_phys,
++					      GFP_KERNEL);
++			use_iram = false;
++	}
++	if (!buf_virt) {
++		use_iram = false;
++		buf_virt = dma_alloc_coherent(sdma->dev, size, &buf_phys,
++				GFP_KERNEL);
++		if (!buf_virt)
++			return -ENOMEM;
 +	}
 +
 +	spin_lock_irqsave(&sdma->channel_0_lock, flags);
@@ -324,13 +721,11 @@ index bc3922fd7fac..9adf3cb5abc9 100644
 +
 +	spin_unlock_irqrestore(&sdma->channel_0_lock, flags);
 +
-+	if (!tiny) {
-+		if (use_iram)
-+			gen_pool_free(sdma->iram_pool, (unsigned long)buf_virt,
-+					size);
-+		else
-+			dma_free_coherent(NULL, size, buf_virt, buf_phys);
-+	}
++	if (use_iram)
++		gen_pool_free(sdma->iram_pool, (unsigned long)buf_virt,
++				size);
++	else
++		dma_free_coherent(sdma->dev, size, buf_virt, buf_phys);
 +
 +	return ret;
 +}
@@ -345,20 +740,20 @@ index bc3922fd7fac..9adf3cb5abc9 100644
 +	int ret;
 +	unsigned long flags;
 +	bool use_iram = true;
-+	bool tiny = (size <= TINY_DATAMEM_BUF_SIZE);
 +
-+	if (!tiny) {
++	if (sdma->iram_pool) {
 +		buf_virt = gen_pool_dma_alloc(sdma->iram_pool, size, &buf_phys);
-+		if (!buf_virt) {
-+			use_iram = false;
-+			buf_virt = dma_alloc_coherent(NULL, size, &buf_phys,
-+					GFP_KERNEL);
-+			if (!buf_virt)
-+				return -ENOMEM;
-+		}
 +	} else {
-+		buf_virt = sdma->tiny_datamem_buf;
-+		buf_phys = sdma->tiny_datamem_buf_phys;
++		buf_virt = dma_alloc_coherent(sdma->dev, size, &buf_phys,
++					      GFP_KERNEL);
++			use_iram = false;
++	}
++	if (!buf_virt) {
++		use_iram = false;
++		buf_virt = dma_alloc_coherent(sdma->dev, size, &buf_phys,
++				GFP_KERNEL);
++		if (!buf_virt)
++			return -ENOMEM;
 +	}
 +	spin_lock_irqsave(&sdma->channel_0_lock, flags);
 +
@@ -374,13 +769,11 @@ index bc3922fd7fac..9adf3cb5abc9 100644
 +
 +	spin_unlock_irqrestore(&sdma->channel_0_lock, flags);
 +
-+	if (!tiny) {
-+		if (use_iram)
-+			gen_pool_free(sdma->iram_pool, (unsigned long)buf_virt,
-+					size);
-+		else
-+			dma_free_coherent(NULL, size, buf_virt, buf_phys);
-+	}
++	if (use_iram)
++		gen_pool_free(sdma->iram_pool, (unsigned long)buf_virt,
++				size);
++	else
++		dma_free_coherent(sdma->dev, size, buf_virt, buf_phys);
 +
 +	return ret;
 +}
@@ -401,78 +794,11 @@ index bc3922fd7fac..9adf3cb5abc9 100644
 +	return sdma_fetch_datamem(sdmac->sdma, buf, num_bytes, addr);
 +}
 +EXPORT_SYMBOL(sdma_fetch_partial_context);
- 
--static void sdma_event_enable(struct sdma_channel *sdmac, unsigned int event)
-+int sdma_event_enable(struct sdma_channel *sdmac, unsigned int event)
- {
- 	struct sdma_engine *sdma = sdmac->sdma;
- 	int channel = sdmac->channel;
--	unsigned long val;
-+	unsigned long oldval, val, flags;
- 	u32 chnenbl = chnenbl_ofs(sdma, event);
- 
--	val = readl_relaxed(sdma->regs + chnenbl);
-+	spin_lock_irqsave(&sdma->event_enable_lock, flags);
-+	oldval = val = readl_relaxed(sdma->regs + chnenbl);
- 	__set_bit(channel, &val);
- 	writel_relaxed(val, sdma->regs + chnenbl);
-+	spin_unlock_irqrestore(&sdma->event_enable_lock, flags);
-+	return (oldval & (1 << channel)) != 0;
-+}
-+EXPORT_SYMBOL(sdma_event_enable);
 +
-+unsigned long sdma_event_enable_by_channel_mask(struct sdma_engine *sdma,
-+	unsigned int channel_mask, unsigned int event)
-+{
-+	unsigned long oldval, val, flags;
-+	u32 chnenbl = chnenbl_ofs(sdma, event);
-+
-+	spin_lock_irqsave(&sdma->event_enable_lock, flags);
-+	oldval = val = readl_relaxed(sdma->regs + chnenbl);
-+	val |= channel_mask;
-+	writel_relaxed(val, sdma->regs + chnenbl);
-+	spin_unlock_irqrestore(&sdma->event_enable_lock, flags);
-+	return oldval;
- }
-+EXPORT_SYMBOL(sdma_event_enable_by_channel_mask);
- 
--static void sdma_event_disable(struct sdma_channel *sdmac, unsigned int event)
-+int sdma_event_disable(struct sdma_channel *sdmac, unsigned int event)
- {
- 	struct sdma_engine *sdma = sdmac->sdma;
- 	int channel = sdmac->channel;
- 	u32 chnenbl = chnenbl_ofs(sdma, event);
--	unsigned long val;
-+	unsigned long oldval, val, flags;
- 
--	val = readl_relaxed(sdma->regs + chnenbl);
-+	spin_lock_irqsave(&sdma->event_enable_lock, flags);
-+	oldval = val = readl_relaxed(sdma->regs + chnenbl);
- 	__clear_bit(channel, &val);
- 	writel_relaxed(val, sdma->regs + chnenbl);
-+	spin_unlock_irqrestore(&sdma->event_enable_lock, flags);
-+	return (oldval & (1 << channel)) != 0;
-+}
-+EXPORT_SYMBOL(sdma_event_disable);
-+
-+unsigned long sdma_event_disable_by_channel_mask(struct sdma_engine *sdma,
-+	unsigned int channel_mask, unsigned int event)
-+{
-+	unsigned long oldval, val, flags;
-+	u32 chnenbl = chnenbl_ofs(sdma, event);
-+
-+	spin_lock_irqsave(&sdma->event_enable_lock, flags);
-+	oldval = val = readl_relaxed(sdma->regs + chnenbl);
-+	val &= ~channel_mask;
-+	writel_relaxed(val, sdma->regs + chnenbl);
-+	spin_unlock_irqrestore(&sdma->event_enable_lock, flags);
-+	return oldval;
- }
-+EXPORT_SYMBOL(sdma_event_disable_by_channel_mask);
- 
  static void sdma_update_channel_loop(struct sdma_channel *sdmac)
  {
-@@ -844,10 +885,18 @@ static void mxc_sdma_handle_channel_normal(struct sdma_channel *data)
+ 	struct sdma_buffer_descriptor *bd;
+@@ -967,6 +991,14 @@ static void mxc_sdma_handle_channel_normal(struct sdma_channel *data)
  		sdmac->status = DMA_COMPLETE;
  }
  
@@ -487,17 +813,9 @@ index bc3922fd7fac..9adf3cb5abc9 100644
  static irqreturn_t sdma_int_handler(int irq, void *dev_id)
  {
  	struct sdma_engine *sdma = dev_id;
--	unsigned long stat;
-+	unsigned long stat, flags;
+@@ -987,7 +1019,9 @@ static irqreturn_t sdma_int_handler(int irq, void *dev_id)
  
- 	stat = readl_relaxed(sdma->regs + SDMA_H_INTR);
- 	writel_relaxed(stat, sdma->regs + SDMA_H_INTR);
-@@ -859,9 +908,11 @@ static irqreturn_t sdma_int_handler(int irq, void *dev_id)
- 		struct sdma_channel *sdmac = &sdma->channel[channel];
- 		struct sdma_desc *desc;
- 
--		spin_lock(&sdmac->vc.lock);
-+		spin_lock_irqsave(&sdmac->vc.lock, flags);
+ 		spin_lock(&sdmac->vc.lock);
  		desc = sdmac->desc;
 -		if (desc) {
 +		if (sdmac->flags & IMX_DMA_CUSTOM_CALLBACK && sdmac->cb.callback) {
@@ -506,39 +824,10 @@ index bc3922fd7fac..9adf3cb5abc9 100644
  			if (sdmac->flags & IMX_DMA_SG_LOOP) {
  				if (sdmac->peripheral_type != IMX_DMATYPE_HDMI)
  					sdma_update_channel_loop(sdmac);
-@@ -876,7 +927,7 @@ static irqreturn_t sdma_int_handler(int irq, void *dev_id)
- 			}
- 		}
- 		__clear_bit(channel, &stat);
--		spin_unlock(&sdmac->vc.lock);
-+		spin_unlock_irqrestore(&sdmac->vc.lock, flags);
- 	}
- 
- 	return IRQ_HANDLED;
-@@ -975,9 +1026,6 @@ static void sdma_get_pc(struct sdma_channel *sdmac,
- 	case IMX_DMATYPE_HDMI:
- 		emi_2_per = sdma->script_addrs->hdmi_dma_addr;
- 		break;
--	case IMX_DMATYPE_MULTI_SAI:
--		per_2_emi = sdma->script_addrs->sai_2_mcu_addr;
--		emi_2_per = sdma->script_addrs->mcu_2_sai_addr;
- 	default:
- 		break;
- 	}
-@@ -1043,7 +1091,7 @@ static int sdma_load_context(struct sdma_channel *sdmac)
- 	bd0->mode.status = BD_DONE | BD_WRAP | BD_EXTD;
- 	bd0->mode.count = sizeof(*context) / 4;
- 	bd0->buffer_addr = sdma->context_phys;
--	bd0->ext_buffer_addr = 2048 + (sizeof(*context) / 4) * channel;
-+	bd0->ext_buffer_addr = sdma_channel_context_base(channel);
- 	ret = sdma_run_channel0(sdma);
- 
- 	spin_unlock_irqrestore(&sdma->channel_0_lock, flags);
-@@ -1083,9 +1131,24 @@ static struct sdma_channel *to_sdma_chan(struct dma_chan *chan)
+@@ -1212,6 +1246,23 @@ static struct sdma_channel *to_sdma_chan(struct dma_chan *chan)
  	return container_of(chan, struct sdma_channel, vc.chan);
  }
  
--static int sdma_disable_channel(struct dma_chan *chan)
 +int sdma_load_partial_context(struct sdma_channel *sdmac,
 +	struct sdma_context_data *context, u32 byte_offset, u32 num_bytes)
 +{
@@ -555,59 +844,12 @@ index bc3922fd7fac..9adf3cb5abc9 100644
 +}
 +EXPORT_SYMBOL(sdma_load_partial_context);
 +
-+static int sdma_disable_channel(struct sdma_channel *sdmac)
- {
--	struct sdma_channel *sdmac = to_sdma_chan(chan);
- 	struct sdma_engine *sdma = sdmac->sdma;
- 	int channel = sdmac->channel;
- 
-@@ -1140,26 +1203,12 @@ static void sdma_set_watermarklevel_for_p2p(struct sdma_channel *sdmac)
- 		sdmac->watermark_level |= SDMA_WATERMARK_LEVEL_DD;
- }
- 
--static void sdma_set_watermarklevel_for_sais(struct sdma_channel *sdmac)
--{
--	sdmac->watermark_level &= ~(0xFFF << SDMA_WATERMARK_LEVEL_FIFOS_OFF |
--				    SDMA_WATERMARK_LEVEL_SW_DONE);
--
--	/* For fifo_num
--	 * bit 0-7 is the fifo number;
--	 * bit 8-11 is the fifo offset,
--	 * so here only need to shift left fifo_num 8 bit for watermake_level
--	 */
--	sdmac->watermark_level |= sdmac->fifo_num<<
--				SDMA_WATERMARK_LEVEL_FIFOS_OFF;
--}
--
- static int sdma_config_channel(struct dma_chan *chan)
++
+ static int sdma_disable_channel(struct dma_chan *chan)
  {
  	struct sdma_channel *sdmac = to_sdma_chan(chan);
- 	int ret;
- 
--	sdma_disable_channel(chan);
-+	sdma_disable_channel(sdmac);
- 
- 	sdmac->event_mask[0] = 0;
- 	sdmac->event_mask[1] = 0;
-@@ -1203,9 +1252,6 @@ static int sdma_config_channel(struct dma_chan *chan)
- 			    sdmac->direction == DMA_MEM_TO_DEV &&
- 			    sdmac->sdma->drvdata == &sdma_imx6ul)
- 				__set_bit(31, &sdmac->watermark_level);
--			else if (sdmac->peripheral_type ==
--					IMX_DMATYPE_MULTI_SAI)
--				sdma_set_watermarklevel_for_sais(sdmac);
- 
- 			__set_bit(sdmac->event_id0, sdmac->event_mask);
- 		}
-@@ -1217,14 +1263,12 @@ static int sdma_config_channel(struct dma_chan *chan)
- 		sdmac->watermark_level = 0; /* FIXME: M3_BASE_ADDRESS */
- 	}
- 
--	sdmac->context_loaded = false;
--
- 	ret = sdma_load_context(sdmac);
- 
- 	return ret;
+@@ -1390,7 +1441,7 @@ static int sdma_config_channel(struct dma_chan *chan)
+ 	return 0;
  }
  
 -static int sdma_set_channel_priority(struct sdma_channel *sdmac,
@@ -615,7 +857,7 @@ index bc3922fd7fac..9adf3cb5abc9 100644
  		unsigned int priority)
  {
  	struct sdma_engine *sdma = sdmac->sdma;
-@@ -1239,6 +1283,25 @@ static int sdma_set_channel_priority(struct sdma_channel *sdmac,
+@@ -1405,6 +1456,25 @@ static int sdma_set_channel_priority(struct sdma_channel *sdmac,
  
  	return 0;
  }
@@ -639,10 +881,10 @@ index bc3922fd7fac..9adf3cb5abc9 100644
 +}
 +EXPORT_SYMBOL(sdma_set_channel_pending_by_mask);
  
- static int sdma_alloc_bd(struct sdma_desc *desc)
+ static int sdma_request_channel0(struct sdma_engine *sdma)
  {
-@@ -1311,6 +1374,23 @@ static int sdma_request_channel0(struct sdma_engine *sdma)
- 	return ret;
+@@ -1465,6 +1535,23 @@ static void sdma_free_bd(struct sdma_desc *desc)
+ 				  desc->bd_phys);
  }
  
 +void sdma_set_channel_interrupt_callback(struct sdma_channel *sdmac,
@@ -662,186 +904,18 @@ index bc3922fd7fac..9adf3cb5abc9 100644
 +}
 +EXPORT_SYMBOL(sdma_set_channel_interrupt_callback);
 +
- static struct sdma_desc *to_sdma_desc(struct dma_async_tx_descriptor *t)
+ static void sdma_desc_free(struct virt_dma_desc *vd)
  {
- 	return container_of(t, struct sdma_desc, vd.tx);
-@@ -1333,7 +1413,7 @@ static int sdma_channel_pause(struct dma_chan *chan)
- 	if (!(sdmac->flags & IMX_DMA_SG_LOOP))
- 		return -EINVAL;
- 
--	sdma_disable_channel(chan);
-+	sdma_disable_channel(sdmac);
- 	spin_lock_irqsave(&sdmac->vc.lock, flags);
- 	sdmac->status = DMA_PAUSED;
- 	spin_unlock_irqrestore(&sdmac->vc.lock, flags);
-@@ -1389,7 +1469,7 @@ static int sdma_terminate_all(struct dma_chan *chan)
- 		sdmac->desc = NULL;
- 	spin_unlock_irqrestore(&sdmac->vc.lock, flags);
- 	vchan_dma_desc_free_list(&sdmac->vc, &head);
--	sdma_disable_channel(chan);
-+	sdma_disable_channel(sdmac);
- 	sdmac->context_loaded = false;
- 
- 	return 0;
-@@ -1593,7 +1673,7 @@ static struct dma_async_tx_descriptor *sdma_prep_memcpy(
- 			param &= ~BD_CONT;
- 		}
- 
--		dev_dbg(sdma->dev, "entry %d: count: %zd dma: 0x%x %s%s\n",
-+		dev_dbg(sdma->dev, "entry %d: count: %d dma: 0x%u %s%s\n",
- 				i, count, bd->buffer_addr,
- 				param & BD_WRAP ? "wrap" : "",
- 				param & BD_INTR ? " intr" : "");
-@@ -1776,7 +1856,7 @@ static struct dma_async_tx_descriptor *sdma_prep_dma_cyclic(
- 		if (i + 1 == num_periods)
- 			param |= BD_WRAP;
- 
--		dev_dbg(sdma->dev, "entry %d: count: %zd dma: %pad %s%s\n",
-+		dev_dbg(sdma->dev, "entry %d: count: %d dma: %pad %s%s\n",
- 				i, period_len, &dma_addr,
- 				param & BD_WRAP ? "wrap" : "",
- 				param & BD_INTR ? " intr" : "");
-@@ -1801,14 +1881,11 @@ static int sdma_config(struct dma_chan *chan,
- 		       struct dma_slave_config *dmaengine_cfg)
- {
- 	struct sdma_channel *sdmac = to_sdma_chan(chan);
--	/* clear watermark_level before setting */
--	sdmac->watermark_level = 0;
- 	if (dmaengine_cfg->direction == DMA_DEV_TO_MEM) {
- 		sdmac->per_address = dmaengine_cfg->src_addr;
- 		sdmac->watermark_level = dmaengine_cfg->src_maxburst *
- 			dmaengine_cfg->src_addr_width;
- 		sdmac->word_size = dmaengine_cfg->src_addr_width;
--		sdmac->fifo_num =  dmaengine_cfg->src_fifo_num;
- 	} else if (dmaengine_cfg->direction == DMA_DEV_TO_DEV) {
- 		sdmac->per_address2 = dmaengine_cfg->src_addr;
- 		sdmac->per_address = dmaengine_cfg->dst_addr;
-@@ -1828,7 +1905,6 @@ static int sdma_config(struct dma_chan *chan,
- 		sdmac->watermark_level = dmaengine_cfg->dst_maxburst *
- 			dmaengine_cfg->dst_addr_width;
- 		sdmac->word_size = dmaengine_cfg->dst_addr_width;
--		sdmac->fifo_num =  dmaengine_cfg->dst_fifo_num;
- 	}
- 	sdmac->direction = dmaengine_cfg->direction;
- 	return sdma_config_channel(chan);
-@@ -1925,7 +2001,7 @@ static void sdma_issue_pending(struct dma_chan *chan)
- #define SDMA_SCRIPT_ADDRS_ARRAY_SIZE_V1	34
- #define SDMA_SCRIPT_ADDRS_ARRAY_SIZE_V2	38
- #define SDMA_SCRIPT_ADDRS_ARRAY_SIZE_V3	41
--#define SDMA_SCRIPT_ADDRS_ARRAY_SIZE_V4	44
-+#define SDMA_SCRIPT_ADDRS_ARRAY_SIZE_V4	42
- 
- static void sdma_add_scripts(struct sdma_engine *sdma,
- 		const struct sdma_script_start_addrs *addr)
-@@ -2111,6 +2187,20 @@ static int sdma_init(struct sdma_engine *sdma)
- 		}
- 	}
- 
-+#if TINY_DATAMEM_BUF_SIZE
-+	sdma->tiny_datamem_buf = gen_pool_dma_alloc(sdma->iram_pool,
-+			TINY_DATAMEM_BUF_SIZE, &sdma->tiny_datamem_buf_phys);
-+	if (!sdma->tiny_datamem_buf) {
-+		sdma->tiny_datamem_buf = dma_alloc_coherent(NULL,
-+				TINY_DATAMEM_BUF_SIZE,
-+				&sdma->tiny_datamem_buf_phys, GFP_KERNEL);
-+		if (!sdma->tiny_datamem_buf) {
-+			ret = -ENOMEM;
-+			goto err_dma_alloc;
-+		}
-+	}
-+#endif
-+
- 	sdma->context = (void *)sdma->channel_control +
- 		MAX_DMA_CHANNELS * sizeof (struct sdma_channel_control);
- 	sdma->context_phys = ccb_phys +
-@@ -2139,10 +2229,7 @@ static int sdma_init(struct sdma_engine *sdma)
- 
- 	/* Set bits of CONFIG register but with static context switching */
- 	/* FIXME: Check whether to set ACR bit depending on clock ratios */
--	if (sdma->clk_ratio)
--		writel_relaxed(SDMA_H_CONFIG_ACR, sdma->regs + SDMA_H_CONFIG);
--	else
--		writel_relaxed(0, sdma->regs + SDMA_H_CONFIG);
-+	writel_relaxed(0, sdma->regs + SDMA_H_CONFIG);
- 
- 	writel_relaxed(ccb_phys, sdma->regs + SDMA_H_C0PTR);
- 
-@@ -2169,10 +2256,6 @@ static bool sdma_filter_fn(struct dma_chan *chan, void *fn_param)
- 
- 	if (!imx_dma_is_general_purpose(chan))
- 		return false;
--	/* return false if it's not the right device */
--	if ((sdmac->sdma->drvdata == &sdma_imx8m)
--		&& (sdmac->sdma->idx != data->idx))
--		return false;
- 
- 	sdmac->data = *data;
- 	chan->private = &sdmac->data;
-@@ -2195,7 +2278,6 @@ static struct dma_chan *sdma_xlate(struct of_phandle_args *dma_spec,
- 	data.dma_request = dma_spec->args[0];
- 	data.peripheral_type = dma_spec->args[1];
- 	data.priority = dma_spec->args[2];
--	data.idx = sdma->idx;
- 
- 	return dma_request_channel(mask, sdma_filter_fn, &data);
- }
-@@ -2235,9 +2317,8 @@ static int sdma_probe(struct platform_device *pdev)
- 	if (!sdma)
- 		return -ENOMEM;
- 
--	sdma->clk_ratio = of_property_read_bool(np, "fsl,ratio-1-1");
--
- 	spin_lock_init(&sdma->channel_0_lock);
-+	spin_lock_init(&sdma->event_enable_lock);
- 
- 	sdma->dev = &pdev->dev;
- 	sdma->drvdata = drvdata;
-@@ -2355,9 +2436,9 @@ static int sdma_probe(struct platform_device *pdev)
- 	sdma->dma_device.device_terminate_all = sdma_terminate_all;
- 	sdma->dma_device.device_pause = sdma_channel_pause;
- 	sdma->dma_device.device_resume = sdma_channel_resume;
--	sdma->dma_device.src_addr_widths = SDMA_DMA_BUSWIDTHS;
--	sdma->dma_device.dst_addr_widths = SDMA_DMA_BUSWIDTHS;
--	sdma->dma_device.directions = SDMA_DMA_DIRECTIONS;
-+	sdma->dma_device.src_addr_widths = BIT(DMA_SLAVE_BUSWIDTH_4_BYTES);
-+	sdma->dma_device.dst_addr_widths = BIT(DMA_SLAVE_BUSWIDTH_4_BYTES);
-+	sdma->dma_device.directions = BIT(DMA_DEV_TO_MEM) | BIT(DMA_MEM_TO_DEV);
- 	sdma->dma_device.residue_granularity = DMA_RESIDUE_GRANULARITY_BURST;
- 	sdma->dma_device.device_prep_dma_memcpy = sdma_prep_memcpy;
- 	sdma->dma_device.device_prep_dma_sg = sdma_prep_memcpy_sg;
-@@ -2389,9 +2470,8 @@ static int sdma_probe(struct platform_device *pdev)
- 		}
- 		of_node_put(spba_bus);
- 	}
--	/* There maybe multi sdma devices such as i.mx8mscale */
--	sdma->idx = sdma_dev_idx++;
+ 	struct sdma_desc *desc = container_of(vd, struct sdma_desc, vd);
+@@ -2467,6 +2554,7 @@ static int sdma_probe(struct platform_device *pdev)
+ 	if (!sdma->drvdata->pm_runtime)
+ 		pm_runtime_get_sync(&pdev->dev);
  
 +	sdma_singleton = sdma;
  	return 0;
  
  err_register:
-@@ -2504,24 +2584,109 @@ static int sdma_resume(struct device *dev)
- 	ret = sdma_get_firmware(sdma, sdma->fw_name);
- 	if (ret) {
- 		dev_warn(&pdev->dev, "failed to get firware\n");
--		goto out;
-+		return ret;
- 	}
- 
- 	ret = sdma_save_restore_context(sdma, false);
- 	if (ret) {
- 		dev_err(sdma->dev, "restore context error!\n");
--		goto out;
-+		return ret;
- 	}
- 
--	ret = 0;
--out:
- 	clk_disable(sdma->clk_ipg);
- 	clk_disable(sdma->clk_ahb);
- 
--	return ret;
-+	return 0;
+@@ -2618,6 +2706,93 @@ static int sdma_resume(struct device *dev)
  }
  #endif
  
@@ -860,7 +934,7 @@ index bc3922fd7fac..9adf3cb5abc9 100644
 + * external=true: channel started by event, HO[i]=1, EO[i]=0 */
 +void sdma_setup_channel(struct sdma_channel *sdmac, bool external)
 +{
-+	sdma_disable_channel(sdmac);
++	sdma_disable_channel(&sdmac->vc.chan);
 +	sdma_config_ownership(sdmac,
 +		external,   /* event override */
 +		!external,  /* host override */
@@ -934,12 +1008,13 @@ index bc3922fd7fac..9adf3cb5abc9 100644
 +
  static const struct dev_pm_ops sdma_pm_ops = {
  	SET_LATE_SYSTEM_SLEEP_PM_OPS(sdma_suspend, sdma_resume)
- };
+ 	SET_RUNTIME_PM_OPS(sdma_runtime_suspend, sdma_runtime_resume, NULL)
 diff --git a/include/linux/platform_data/dma-imx-sdma.h b/include/linux/platform_data/dma-imx-sdma.h
-index 3ecbf2fac02c..c6b87f57185a 100644
+index e12d2e8c246b..1510b643c494 100644
 --- a/include/linux/platform_data/dma-imx-sdma.h
 +++ b/include/linux/platform_data/dma-imx-sdma.h
-@@ -1,6 +1,8 @@
+@@ -1,7 +1,8 @@
+-/* SPDX-License-Identifier: GPL-2.0 */
  #ifndef __MACH_MXC_SDMA_H__
  #define __MACH_MXC_SDMA_H__
  
@@ -948,18 +1023,7 @@ index 3ecbf2fac02c..c6b87f57185a 100644
  /**
   * struct sdma_script_start_addrs - SDMA script start pointers
   *
-@@ -52,10 +54,6 @@ struct sdma_script_start_addrs {
- 	s32 zqspi_2_mcu_addr;
- 	s32 mcu_2_ecspi_addr;
- 	/* End of v3 array */
--	s32 mcu_2_zqspi_addr;
--	s32 mcu_2_sai_addr;
--	s32 sai_2_mcu_addr;
--	/* End of v4 array */
- };
- 
- /**
-@@ -69,4 +67,326 @@ struct sdma_platform_data {
+@@ -72,4 +73,320 @@ struct sdma_platform_data {
  	struct sdma_script_start_addrs *script_addrs;
  };
  
@@ -1146,10 +1210,8 @@ index 3ecbf2fac02c..c6b87f57185a 100644
 + * sdma_event_enable() - allows a channel to be triggered by the numbered event
 + * @sdmac:	pointer to sdma_channel object
 + * @event:	event number (see reference manual)
-+ * Return:	0 if the event was previously disabled,
-+ *          nonzero if previously enabled
 + */
-+int sdma_event_enable(struct sdma_channel *sdmac, unsigned int event);
++void sdma_event_enable(struct sdma_channel *sdmac, unsigned int event);
 +
 +/**
 + * sdma_event_enable_by_channel_mask() - allows a group of channels to be
@@ -1157,19 +1219,16 @@ index 3ecbf2fac02c..c6b87f57185a 100644
 + * @sdma:	pointer to the sdma_engine object
 + * @channel_mask: bitmask of channels to enable
 + * @event:	event number (see reference manual)
-+ * Return:	previous channel enable bitmask for the event
 + */
-+unsigned long sdma_event_enable_by_channel_mask(struct sdma_engine *sdma,
++void sdma_event_enable_by_channel_mask(struct sdma_engine *sdma,
 +	unsigned int channel_mask, unsigned int event);
 +
 +/**
 + * sdma_event_disable() - prevents a channel from being triggered by an event
 + * @sdmac:	pointer to sdma_channel object
 + * @event:	event number (see reference manual)
-+ * Return:	0 if the event was previously disabled,
-+ *          nonzero if previously enabled
 + */
-+int sdma_event_disable(struct sdma_channel *sdmac, unsigned int event);
++void sdma_event_disable(struct sdma_channel *sdmac, unsigned int event);
 +
 +/**
 + * sdma_event_disable_by_channel_mask() - prevents a group of channels from
@@ -1177,9 +1236,8 @@ index 3ecbf2fac02c..c6b87f57185a 100644
 + * @sdma:	pointer to the sdma_engine object
 + * @channel_mask: bitmask of channels to disable
 + * @event:	event number (see reference manual)
-+ * Return:	previous channel enable bitmask for the event
 + */
-+unsigned long sdma_event_disable_by_channel_mask(struct sdma_engine *sdma,
++void sdma_event_disable_by_channel_mask(struct sdma_engine *sdma,
 +	unsigned int channel_mask, unsigned int event);
 +
 +/**
@@ -1286,6 +1344,153 @@ index 3ecbf2fac02c..c6b87f57185a 100644
 +ssize_t sdma_print_context(struct sdma_engine *sdma, int channel, char *buf);
 +
  #endif /* __MACH_MXC_SDMA_H__ */
+diff --git a/include/linux/platform_data/epit-imx.h b/include/linux/platform_data/epit-imx.h
+new file mode 100644
+index 000000000000..c4efdc694c7b
+--- /dev/null
++++ b/include/linux/platform_data/epit-imx.h
+@@ -0,0 +1,141 @@
++/**
++ * Low-level i.MX6 EPIT API.
++ * Copyright (C) 2015-2018 Glowforge, Inc. <opensource@glowforge.com>
++ *
++ * The i.MX6 has two EPIT (Enhanced Periodic Interrupt Timer) units, both of
++ * which are unused by the Linux kernel. This header exposes a low-level API
++ * for configuring an EPIT.
++ */
++
++#ifndef __MACH_MXC_EPIT_H__
++#define __MACH_MXC_EPIT_H__
++
++#include <linux/types.h>
++
++struct epit;
++struct device_node;
++
++typedef void (*epit_cb)(void *);
++
++/**
++ * epit_get() - returns a pointer to the EPIT for the given device_node
++ * @np:		device tree node for EPIT1 or EPIT2
++ *
++ * Return: pointer to epit object, or NULL
++ */
++struct epit *epit_get(struct device_node *np);
++
++/**
++ * epit_init_freerunning() - initializes EPIT in "set and forget" mode
++ * @epit:	pointer to epit object
++ * @callback:	function to execute periodically
++ * @cb_arg:	user-defined object passed when the callback is invoked
++ *
++ * The timer is started when epit_start() is called.
++ * If callback is non-NULL, it will be executed (in interrupt context) when the
++ * timer overflows.
++ *
++ * Return: 0 on success, nonzero otherwise
++ */
++int epit_init_freerunning(struct epit *epit, epit_cb callback, void *cb_arg);
++
++/**
++ * epit_init_oneshot() - initializes EPIT for retriggerable one-shot timeouts
++ * @epit:	pointer to epit object
++ * @callback:	function to execute periodically
++ * @cb_arg:	user-defined object passed when the callback is invoked
++ *
++ * The timer is started when epit_start() is called, and the callback is
++ * executed with the given argument (in interupt context) if the timeout is
++ * reached.
++ */
++int epit_init_oneshot(struct epit *epit, epit_cb callback, void *cb_arg);
++
++/**
++ * epit_hz_to_divisor() - converts frequency in hertz to a clock divider value
++ * @epit:	pointer to epit object
++ * @hz:		frequency in Hz
++ *
++ * Return: divisor value for the desired frequency
++ */
++u32 epit_hz_to_divisor(struct epit *epit, u32 hz);
++
++/**
++ * epit_start() - starts an EPIT with the given period
++ * @epit:	pointer to epit object
++ * @divisor:	length of timer interval in ticks
++ */
++void epit_start(struct epit *epit, u32 divisor);
++
++/**
++ * epit_start_hz() - starts a free-running EPIT with the given frequency
++ * @epit:	pointer to epit object
++ * @hz:		frequency in Hz
++ */
++void epit_start_hz(struct epit *epit, u32 hz);
++
++/**
++ * epit_stop() - stops an EPIT
++ * @epit:	pointer to epit object
++ */
++void epit_stop(struct epit *epit);
++
++/**
++ * epit_set_divisor() - change an EPIT's period
++ * @epit:	pointer to epit object
++ * @divisor:	new length of timer interval in ticks
++ *
++ * Takes effect the next time epit_start() is called.
++ */
++void epit_set_divisor(struct epit *epit, u32 divisor);
++
++/**
++ * epit_set_hz() - change an EPIT's frequency
++ * @epit:	pointer to epit object
++ * @hz:		new frequency in Hz
++ *
++ * Takes effect the next time epit_start() is called.
++ */
++void epit_set_hz(struct epit *epit, u32 hz);
++
++/**
++ * epit_count() - returns the EPIT's current count
++ * @epit:	pointer to epit object
++ *
++ * Return: current value of the EPIT's counter
++ */
++u32 epit_count(struct epit *epit);
++
++/**
++ * epit_is_running() - returns whether or not an EPIT is running
++ * @epit:	pointer to epit object
++ *
++ * Return: 1 if timer is running, 0 otherwise
++ */
++int epit_is_running(struct epit *epit);
++
++/**
++ * epit_irq() - returns the EPIT's IRQ number
++ * @epit:	pointer to epit object
++ *
++ * Return: the EPIT's IRQ number
++ */
++int epit_irq(struct epit *epit);
++
++/**
++ * epit_sdma_event() - returns the EPIT's SDMA event number
++ * @epit:	pointer to epit object
++ *
++ * Return: the EPIT's SDMA event number
++ */
++int epit_sdma_event(struct epit *epit);
++
++/**
++ * epit_status_register_address() - returns physical address of status register
++ * @epit:	pointer to epit object
++ *
++ * Return: the physical address of the EPIT's EPITSR register
++ */
++u32 epit_status_register_address(struct epit *epit);
++
++#endif
 -- 
-2.17.1
+2.32.0
 
